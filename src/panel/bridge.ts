@@ -1,0 +1,624 @@
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import * as vscode from 'vscode';
+import { getConfig } from '../config';
+import { humanizeError } from '../core/errors';
+import { ServerRegistry } from '../connection';
+import { VllmClient, VllmModel } from '../vllm/client';
+import { logError } from '../logger';
+import { OpencodeClient } from '../opencode/client';
+import { OpencodeEvent, PromptBody } from '../opencode/protocol';
+import { OpencodeServerManager } from '../opencode/serverManager';
+import { HostToWebview, UiImage, UiModel, UiSession, WebviewToHost } from '../shared';
+
+export interface BridgeDeps {
+  context: vscode.ExtensionContext;
+  server: OpencodeServerManager;
+  vllm: VllmClient;
+  servers: ServerRegistry;
+}
+
+const MODEL_KEY = 'vllmCode.model';
+
+/**
+ * Connects one webview (sidebar view or editor tab) to the OpenCode server.
+ * Owns the conversation state for that webview and relays the SSE event stream.
+ *
+ * vLLM has no model pull / load / unload / keep_alive — a server serves a fixed
+ * base model — so this bridge only discovers + selects models; it never warms
+ * or resizes them. Process / LoRA / download management lives in the separate
+ * model-manager panel.
+ */
+export class ChatBridge {
+  private client: OpencodeClient | undefined;
+  private currentSessionID: string | null = null;
+  private currentModel: string | null = null;
+  private agent: 'build' | 'plan';
+  private eventAbort: AbortController | undefined;
+  private disposed = false;
+  private connected = false;
+  private connecting = false;
+  private currentTitle = '';
+  private agentsWarned = false;
+  private activeFile: { abs: string; rel: string; chars: number } | null = null;
+  private editorSub: vscode.Disposable | undefined;
+  private messageSub: vscode.Disposable | undefined;
+  private healthTimer: ReturnType<typeof setInterval> | undefined;
+  private healthTicks = 0;
+  private titleSink: ((t: string) => void) | undefined;
+
+  constructor(
+    private readonly webview: vscode.Webview,
+    private readonly deps: BridgeDeps,
+  ) {
+    this.agent = getConfig().agent;
+    this.messageSub = webview.onDidReceiveMessage((m: WebviewToHost) => this.onMessage(m));
+    this.editorSub = vscode.window.onDidChangeActiveTextEditor((e) => this.updateActiveFile(e));
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    this.messageSub?.dispose();
+    this.eventAbort?.abort();
+    this.editorSub?.dispose();
+    if (this.healthTimer) {
+      clearInterval(this.healthTimer);
+      this.healthTimer = undefined;
+    }
+  }
+
+  /**
+   * Poll vLLM so the panel self-heals: when the server comes online after being
+   * down we auto-connect (no manual Retry), and while connected we periodically
+   * refresh the model list so a newly served model / loaded LoRA appears.
+   */
+  private startHealthPoll(): void {
+    if (this.healthTimer || this.disposed) {
+      return;
+    }
+    this.healthTimer = setInterval(async () => {
+      if (this.disposed || this.connecting) {
+        return;
+      }
+      let ok = false;
+      try {
+        ok = await this.deps.vllm.checkConnection();
+      } catch {
+        ok = false;
+      }
+      if (ok && !this.connected) {
+        await this.init(); // came online → full setup + model load
+      } else if (ok && this.connected) {
+        if (++this.healthTicks % 3 === 0) {
+          await this.refreshModelsToWebview().catch(() => undefined); // ~every 15s
+        }
+      } else if (!ok && this.connected) {
+        this.connected = false;
+        this.postServers(false); // went offline → show the banner
+      }
+    }, 5000);
+  }
+
+  private updateActiveFile(editor: vscode.TextEditor | undefined): void {
+    // Keep the last real file when focus moves to the webview/panel.
+    if (!editor || editor.document.uri.scheme !== 'file') {
+      return;
+    }
+    const abs = editor.document.uri.fsPath;
+    this.activeFile = {
+      abs,
+      rel: vscode.workspace.asRelativePath(abs),
+      chars: editor.document.getText().length,
+    };
+    this.post({ type: 'activeFile', path: this.activeFile.rel, chars: this.activeFile.chars });
+  }
+
+  /** Start a fresh conversation (invoked by the New Chat command). */
+  async requestNewChat(): Promise<void> {
+    if (this.client) {
+      await this.newSession();
+    }
+  }
+
+  /** Ask the webview to run a UI command (e.g. open history overlay). */
+  sendCommand(command: 'history' | 'newChat' | 'focusInput'): void {
+    this.post({ type: 'command', command });
+  }
+
+  /** Provide a callback that sets the host view/tab title (the session name). */
+  setTitleSink(fn: (t: string) => void): void {
+    this.titleSink = fn;
+  }
+
+  private updateTitle(title: string): void {
+    this.currentTitle = title || 'New chat';
+    this.titleSink?.(this.currentTitle);
+  }
+
+  private post(msg: HostToWebview): void {
+    if (!this.disposed) {
+      void this.webview.postMessage(msg);
+    }
+  }
+
+  private async onMessage(msg: WebviewToHost): Promise<void> {
+    if (this.disposed) {
+      return;
+    }
+    try {
+      switch (msg.type) {
+        case 'ready':
+          await this.init();
+          break;
+        case 'send':
+          await this.handleSend(msg.text, msg.thinking, msg.images ?? [], msg.includeActiveFile ?? false);
+          break;
+        case 'selectModel':
+          this.currentModel = msg.modelID;
+          await this.deps.context.workspaceState.update(MODEL_KEY, msg.modelID);
+          break;
+        case 'refreshModels':
+          await this.refreshModelsToWebview();
+          break;
+        case 'openManager':
+          await vscode.commands.executeCommand('vllmCode.openManager');
+          break;
+        case 'listServers':
+          this.postServers(this.connected);
+          break;
+        case 'addServer':
+          await this.deps.servers.add(msg.name, msg.url);
+          this.postServers(this.connected);
+          break;
+        case 'updateServer':
+          await this.deps.servers.update(msg.id, msg.name, msg.url);
+          if (this.deps.servers.active().id === msg.id) {
+            await this.switchServer(msg.id);
+          } else {
+            this.postServers(this.connected);
+          }
+          break;
+        case 'removeServer': {
+          const wasActive = this.deps.servers.active().id === msg.id;
+          await this.deps.servers.remove(msg.id);
+          if (wasActive) {
+            await this.switchServer(this.deps.servers.active().id);
+          } else {
+            this.postServers(this.connected);
+          }
+          break;
+        }
+        case 'switchServer':
+          await this.switchServer(msg.id);
+          break;
+        case 'selectAgent':
+          this.agent = msg.agent;
+          break;
+        case 'newChat':
+          await this.newSession();
+          break;
+        case 'loadSessions':
+          await this.sendSessions();
+          break;
+        case 'loadSession':
+          await this.loadSession(msg.sessionID);
+          break;
+        case 'deleteSession': {
+          const wasCurrent = msg.sessionID === this.currentSessionID;
+          await this.client?.deleteSession(msg.sessionID);
+          if (wasCurrent) {
+            this.currentSessionID = null;
+            await this.newSession(false);
+          }
+          await this.sendSessions();
+          break;
+        }
+        case 'clearAllSessions':
+          await this.clearAllSessions();
+          break;
+        case 'abort':
+          if (this.currentSessionID) {
+            await this.client?.abort(this.currentSessionID);
+          }
+          break;
+        case 'permission':
+          await this.client?.respondPermission(msg.sessionID, msg.permissionID, msg.response);
+          break;
+        case 'questionReply':
+          await this.client?.replyQuestion(msg.requestID, msg.answers);
+          break;
+        case 'questionReject':
+          await this.client?.rejectQuestion(msg.requestID);
+          break;
+        case 'openFile':
+          await this.openFile(msg.path);
+          break;
+        case 'retryConnect':
+          await this.init();
+          break;
+      }
+    } catch (err) {
+      logError(`handling ${msg.type}`, err);
+      this.post({ type: 'error', message: humanizeError(err, { subject: 'vLLM' }) });
+      this.post({ type: 'busy', busy: false });
+    }
+  }
+
+  private async init(): Promise<void> {
+    this.startHealthPoll();
+    if (this.connecting) {
+      return;
+    }
+    this.connecting = true;
+    try {
+      await this.doInit();
+    } finally {
+      this.connecting = false;
+    }
+  }
+
+  private async doInit(): Promise<void> {
+    const cfg = getConfig();
+    const active = this.deps.servers.active();
+    this.deps.vllm.setBaseUrl(active.url);
+    this.deps.vllm.setApiKey(cfg.apiKey);
+    const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
+
+    this.post({ type: 'status', text: `Connecting to ${active.name}…` });
+    this.connected = await this.deps.vllm.checkConnection();
+    this.postServers(this.connected);
+
+    // Offline: show the connection screen and wait for retry / switch.
+    if (!this.connected) {
+      this.post({
+        type: 'init',
+        models: [],
+        currentModel: null,
+        agent: this.agent,
+        cwd,
+        serverReady: false,
+        connected: false,
+        minContext: cfg.minContextLength,
+      });
+      this.post({ type: 'status', text: `Can't reach vLLM at ${active.url}`, kind: 'warn' });
+      return;
+    }
+
+    this.post({ type: 'status', text: 'Starting OpenCode server…' });
+    let started;
+    try {
+      started = await this.deps.server.start();
+    } catch (err) {
+      const message = humanizeError(err, { subject: 'the OpenCode server' });
+      this.post({ type: 'error', message });
+      this.post({
+        type: 'init',
+        models: [],
+        currentModel: null,
+        agent: this.agent,
+        cwd,
+        serverReady: false,
+        connected: true,
+        minContext: cfg.minContextLength,
+      });
+      return;
+    }
+    this.client = started.client;
+
+    const models = await this.loadModels();
+    const stored = this.deps.context.workspaceState.get<string>(MODEL_KEY);
+    this.currentModel =
+      pickModel([cfg.defaultModel, stored ?? '', this.currentModel ?? ''], models) ?? null;
+
+    this.startEventStream();
+
+    this.post({
+      type: 'init',
+      models,
+      currentModel: this.currentModel,
+      agent: this.agent,
+      cwd,
+      serverReady: true,
+      connected: true,
+      minContext: cfg.minContextLength,
+    });
+
+    await this.sendSessions();
+    if (!this.currentSessionID) {
+      await this.newSession(false);
+    }
+    this.updateActiveFile(vscode.window.activeTextEditor);
+    this.warnIfAgentsLarge();
+    this.post({ type: 'status', text: '' });
+  }
+
+  /** Warn once if AGENTS.md/CLAUDE.md (auto-loaded by OpenCode) is large. */
+  private warnIfAgentsLarge(): void {
+    if (this.agentsWarned) {
+      return;
+    }
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!root) {
+      return;
+    }
+    let bytes = 0;
+    const found: string[] = [];
+    for (const name of ['AGENTS.md', 'CLAUDE.md']) {
+      try {
+        const st = fs.statSync(path.join(root, name));
+        if (st.isFile()) {
+          bytes += st.size;
+          found.push(name);
+        }
+      } catch {
+        // not present
+      }
+    }
+    if (!found.length) {
+      return;
+    }
+    const estTokens = Math.round(bytes / 4);
+    const win = getConfig().minContextLength;
+    // Guard against a non-positive context setting making the threshold `>= 0`
+    // (which would warn on every workspace that has an AGENTS.md/CLAUDE.md).
+    if (win > 0 && estTokens >= win * 0.4) {
+      this.agentsWarned = true;
+      const pct = Math.round((estTokens / win) * 100);
+      const over = estTokens >= win;
+      vscode.window.showWarningMessage(
+        `vLLM Code: ${found.join(' + ')} is ~${Math.round(estTokens / 1000)}k tokens (~${pct}% of your ${Math.round(win / 1000)}k context)${over ? ' — larger than the context window' : ''}. It's auto-included on every request and may crowd out the conversation. Consider trimming it or raising vllmCode.minContextLength.`,
+      );
+    }
+  }
+
+  private postServers(connected: boolean): void {
+    this.connected = connected;
+    this.post({
+      type: 'servers',
+      servers: this.deps.servers.list().map((s) => ({ id: s.id, name: s.name, url: s.url })),
+      activeId: this.deps.servers.active().id,
+      connected,
+    });
+  }
+
+  /** Switch the active vLLM server: tear down OpenCode and re-initialize. */
+  private async switchServer(id: string): Promise<void> {
+    await this.deps.servers.setActive(id);
+    this.eventAbort?.abort();
+    this.eventAbort = undefined;
+    this.client = undefined;
+    this.currentSessionID = null;
+    this.deps.server.dispose();
+    this.post({ type: 'cleared' });
+    await this.init();
+  }
+
+  private async refreshModelsToWebview(): Promise<VllmModel[]> {
+    const list = await this.deps.vllm.listModels();
+    this.post({ type: 'models', models: this.mapModels(list), currentModel: this.currentModel });
+    return list;
+  }
+
+  private async loadModels(): Promise<UiModel[]> {
+    return this.mapModels(await this.deps.vllm.listModels());
+  }
+
+  private mapModels(list: VllmModel[]): UiModel[] {
+    // vLLM base models are always "loaded" (resident for the server lifetime).
+    // LoRA adapters are shown but flagged so the picker can group them.
+    return list.map((m) => ({
+      id: m.id,
+      name: m.displayName,
+      loaded: true,
+      maxContextLength: m.maxContextLength,
+      isLora: m.isLora,
+      parent: m.parent,
+    }));
+  }
+
+  private async newSession(announce = true): Promise<void> {
+    if (!this.client) {
+      throw new Error('OpenCode server is not running.');
+    }
+    const session = await this.client.createSession('New chat');
+    this.currentSessionID = session.id;
+    this.updateTitle('New chat');
+    this.post({ type: 'cleared' });
+    if (announce) {
+      await this.sendSessions();
+    }
+  }
+
+  private async sendSessions(): Promise<void> {
+    if (!this.client) {
+      return;
+    }
+    const sessions = await this.client.listSessions();
+    const ui: UiSession[] = sessions.map((s) => ({
+      id: s.id,
+      title: s.title || 'Untitled',
+      updated: s.time?.updated ?? 0,
+    }));
+    const current = ui.find((s) => s.id === this.currentSessionID);
+    if (current) {
+      this.updateTitle(current.title);
+    }
+    this.post({ type: 'sessions', sessions: ui, currentSessionID: this.currentSessionID });
+  }
+
+  private async clearAllSessions(): Promise<void> {
+    if (!this.client) {
+      return;
+    }
+    this.post({ type: 'status', text: 'Clearing sessions…' });
+    const sessions = await this.client.listSessions();
+    for (const s of sessions) {
+      await this.client.deleteSession(s.id).catch(() => undefined);
+    }
+    this.currentSessionID = null;
+    await this.newSession(false);
+    this.post({ type: 'cleared' });
+    this.post({ type: 'status', text: '' });
+    await this.sendSessions();
+  }
+
+  private async loadSession(sessionID: string): Promise<void> {
+    if (!this.client) {
+      return;
+    }
+    this.currentSessionID = sessionID;
+    const messages = await this.client.getMessages(sessionID);
+    const sessions = await this.client.listSessions();
+    const title = sessions.find((s) => s.id === sessionID)?.title ?? 'Chat';
+    this.updateTitle(title);
+    this.post({ type: 'sessionLoaded', sessionID, title, messages });
+  }
+
+  private async handleSend(
+    text: string,
+    thinking: boolean,
+    images: UiImage[],
+    includeActiveFile: boolean,
+  ): Promise<void> {
+    if (!this.client) {
+      throw new Error('OpenCode server is not running.');
+    }
+    if (!this.currentModel) {
+      throw new Error('No vLLM model selected.');
+    }
+    if (!this.currentSessionID) {
+      await this.newSession(false);
+    }
+
+    // Identity: OpenCode's base prompt makes the model call itself "opencode".
+    // Our system text is appended, so this overrides the user-facing identity.
+    let system =
+      'You are "vLLM Code", an agentic coding assistant running against the user\'s local vLLM server. If asked your name or what you are, identify as "vLLM Code". Never identify yourself as "opencode".';
+
+    // Thinking control. Qwen-family models honor the `/no_think` soft switch
+    // (consumed by the chat template); for others fall back to a system hint.
+    let promptText = text;
+    if (!thinking) {
+      if (/qwen/i.test(this.currentModel)) {
+        promptText = `${text}\n\n/no_think`;
+      } else {
+        system += '\n\nAnswer directly and concisely. Do not produce private chain-of-thought or <think> reasoning blocks.';
+      }
+    }
+
+    const parts: PromptBody['parts'] = [{ type: 'text', text: promptText }];
+    for (const img of images) {
+      parts.push({ type: 'file', mime: img.mime, url: img.dataUrl, filename: img.name });
+    }
+    // Attach the currently open file as context (excludable from the UI).
+    if (includeActiveFile && this.activeFile) {
+      try {
+        const MAX = 80 * 1024;
+        let content = fs.readFileSync(this.activeFile.abs, 'utf8');
+        if (content.length > MAX) {
+          content = content.slice(0, MAX) + '\n\n…[truncated]';
+        }
+        parts.push({
+          type: 'file',
+          mime: 'text/plain',
+          filename: this.activeFile.rel,
+          url: `file://${this.activeFile.abs}`,
+          source: { type: 'file', path: this.activeFile.abs, text: { value: content, start: 0, end: content.length } },
+        });
+      } catch (err) {
+        logError('attach active file failed', err);
+      }
+    }
+
+    this.post({ type: 'busy', busy: true });
+    await this.client.promptAsync(this.currentSessionID!, {
+      model: { providerID: 'vllm', modelID: this.currentModel },
+      agent: this.agent,
+      ...(system ? { system } : {}),
+      parts,
+    });
+
+    // Auto-name the session from the first user prompt.
+    if ((this.currentTitle === 'New chat' || this.currentTitle === '') && text.trim()) {
+      const title = deriveTitle(text);
+      if (title) {
+        try {
+          await this.client.updateSession(this.currentSessionID!, { title });
+        } catch (err) {
+          logError('auto-title failed', err);
+        }
+        this.updateTitle(title);
+        await this.sendSessions();
+      }
+    }
+  }
+
+  private startEventStream(): void {
+    if (this.eventAbort || !this.client) {
+      return;
+    }
+    this.eventAbort = new AbortController();
+    void this.client.subscribeEvents((event) => this.relayEvent(event), this.eventAbort.signal);
+  }
+
+  /** Forward only events that belong to the active session (plus globals). */
+  private relayEvent(event: OpencodeEvent): void {
+    const sid = sessionIdOf(event);
+    // Drop a session-scoped event unless it's for the active session. Also drop
+    // it when no session is active yet (sid set, currentSessionID null) so a
+    // stray event mid-init can't leak into the webview.
+    if (sid && sid !== this.currentSessionID) {
+      return;
+    }
+    this.post({ type: 'event', event });
+  }
+
+  private async openFile(p: string): Promise<void> {
+    const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
+    const abs = path.isAbsolute(p) ? p : path.join(cwd, p);
+    try {
+      const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(abs));
+      await vscode.window.showTextDocument(doc, { preview: true });
+    } catch (err) {
+      logError(`openFile ${abs}`, err);
+    }
+  }
+}
+
+function sessionIdOf(event: OpencodeEvent): string | undefined {
+  const p = event.properties as any;
+  return (
+    p?.sessionID ??
+    p?.info?.sessionID ??
+    p?.part?.sessionID ??
+    undefined
+  );
+}
+
+/** Derive a concise session title from the first user prompt. */
+function deriveTitle(text: string): string {
+  let t = text
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/`([^`]*)`/g, '$1')
+    .replace(/https?:\/\/\S+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!t) {
+    return '';
+  }
+  const firstSentence = t.split(/(?<=[.!?])\s|\n/)[0].trim() || t;
+  const words = firstSentence.split(' ').slice(0, 8).join(' ');
+  let title = words.length > 52 ? words.slice(0, 52).trim() + '…' : words;
+  title = title.replace(/[.,;:]+$/, '');
+  return title.charAt(0).toUpperCase() + title.slice(1);
+}
+
+function pickModel(preferences: string[], models: UiModel[]): string | undefined {
+  for (const pref of preferences) {
+    if (pref && models.some((m) => m.id === pref)) {
+      return pref;
+    }
+  }
+  const loaded = models.find((m) => m.loaded && !m.isLora);
+  return loaded?.id ?? models.find((m) => !m.isLora)?.id ?? models[0]?.id;
+}

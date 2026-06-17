@@ -1,0 +1,17 @@
+version: 0.1.0
+date: 2026-06-16
+highlights:
+  - First release — an agentic coding panel for your vLLM server, powered by the bundled OpenCode agent.
+  - New Model Manager: start/stop local vLLM instances, download models from Hugging Face, and load/unload LoRA adapters.
+added:
+  - Chat panel with streaming timeline, tool cards, permission prompts, and session history.
+  - vLLM provider wired through OpenCode's OpenAI-compatible /v1 endpoint with real token-usage metering.
+  - Model picker sourced from /v1/models (base models plus loaded LoRA adapters).
+  - Model Manager panel — Instances (vllm serve with max-model-len, GPU util, dtype, quantization, tensor-parallel, enable-lora), Models (Hugging Face download + cache browser), and LoRA (runtime load/unload).
+  - Multi-server registry for local, WSL, Docker, or remote vLLM endpoints, with offline auto-reconnect.
+  - Optional bearer-token auth for servers started with --api-key.
+  - All six platform VSIXes with the matching OpenCode binary bundled.
+changed:
+  - Forked from ollama-vscode-chat; the backend is now vLLM over its OpenAI-compatible API.
+removed:
+  - Ollama-only model load/eject, keep_alive, and per-request num_ctx controls (no vLLM equivalent — context is fixed at server launch).
