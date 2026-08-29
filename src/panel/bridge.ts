@@ -42,6 +42,7 @@ export class ChatBridge {
   private agentsWarned = false;
   private activeFile: { abs: string; rel: string; chars: number } | null = null;
   private editorSub: vscode.Disposable | undefined;
+  private tabsSub: vscode.Disposable | undefined;
   private messageSub: vscode.Disposable | undefined;
   private healthTimer: ReturnType<typeof setInterval> | undefined;
   private healthTicks = 0;
@@ -53,7 +54,13 @@ export class ChatBridge {
   ) {
     this.agent = getConfig().agent;
     this.messageSub = webview.onDidReceiveMessage((m: WebviewToHost) => this.onMessage(m));
-    this.editorSub = vscode.window.onDidChangeActiveTextEditor((e) => this.updateActiveFile(e));
+    this.editorSub = vscode.window.onDidChangeActiveTextEditor((e) => {
+      this.updateActiveFile(e);
+      this.pruneClosedContext();
+    });
+    // Closing a tab is the one way the tracked file goes stale silently — see
+    // pruneClosedContext.
+    this.tabsSub = vscode.window.tabGroups.onDidChangeTabs(() => this.pruneClosedContext());
   }
 
   dispose(): void {
@@ -61,6 +68,7 @@ export class ChatBridge {
     this.messageSub?.dispose();
     this.eventAbort?.abort();
     this.editorSub?.dispose();
+    this.tabsSub?.dispose();
     if (this.healthTimer) {
       clearInterval(this.healthTimer);
       this.healthTimer = undefined;
@@ -97,6 +105,49 @@ export class ChatBridge {
         this.postServers(false); // went offline → show the banner
       }
     }, 5000);
+  }
+
+  /**
+   * Absolute paths of every file currently open in the editor — tabs (including
+   * both sides of a diff) plus visible editors. The tab list is what a user
+   * means by "open", so it's what decides whether the tracked file survives.
+   */
+  private openFilePaths(): Set<string> {
+    const paths = new Set<string>();
+    const add = (uri: vscode.Uri | undefined): void => {
+      if (uri && uri.scheme === 'file') {
+        paths.add(uri.fsPath);
+      }
+    };
+    for (const group of vscode.window.tabGroups.all) {
+      for (const tab of group.tabs) {
+        const input = tab.input as
+          | { uri?: vscode.Uri; modified?: vscode.Uri; original?: vscode.Uri }
+          | undefined;
+        add(input?.uri);
+        add(input?.modified);
+        add(input?.original);
+      }
+    }
+    for (const editor of vscode.window.visibleTextEditors) {
+      add(editor.document.uri);
+    }
+    return paths;
+  }
+
+  /**
+   * Drop the tracked file once it is no longer open. updateActiveFile keeps its
+   * last value when the active editor goes undefined (so clicking into the
+   * composer doesn't wipe the user's context), and closing a tab fires no
+   * active-editor change for that document — so without this a closed file
+   * stayed pinned forever, showing a phantom "Include open file" row and
+   * attaching itself to every later message.
+   */
+  private pruneClosedContext(): void {
+    if (this.activeFile && !this.openFilePaths().has(this.activeFile.abs)) {
+      this.activeFile = null;
+      this.post({ type: 'activeFile', path: null, chars: 0 });
+    }
   }
 
   private updateActiveFile(editor: vscode.TextEditor | undefined): void {
@@ -328,6 +379,9 @@ export class ChatBridge {
       await this.newSession(false);
     }
     this.updateActiveFile(vscode.window.activeTextEditor);
+    // A reloaded webview re-runs init with the bridge's remembered file — drop
+    // it if that file was closed while the panel was away.
+    this.pruneClosedContext();
     this.warnIfAgentsLarge();
     this.post({ type: 'status', text: '' });
   }
@@ -486,6 +540,9 @@ export class ChatBridge {
     if (!this.currentModel) {
       throw new Error('No vLLM model selected.');
     }
+    // Last word on what's actually open, so a file closed since the last editor
+    // event can never ride along on the prompt.
+    this.pruneClosedContext();
     if (!this.currentSessionID) {
       await this.newSession(false);
     }
