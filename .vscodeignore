@@ -23,3 +23,12 @@ media/screenshots/**
 releasenotes/**
 *HANDOFF.md
 sample-workspace/**
+
+# Local agent/tool config and generated code-graph output. These are untracked,
+# so a CI build from a fresh checkout never sees them — but a local
+# `vsce package` would happily publish your absolute paths and an extracted
+# copy of the source. Keep them out regardless of who is packaging.
+.codex/**
+.mcp.json
+opencode.json
+graphoxide-out/**

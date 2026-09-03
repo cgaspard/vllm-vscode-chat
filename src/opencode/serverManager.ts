@@ -2,10 +2,12 @@ import { ChildProcess, spawn } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import * as vscode from 'vscode';
 import { ExtensionConfig, getConfig } from '../config';
 import { resolveBinaryPath } from '../core/binary';
 import { clampContext } from '../core/context';
+import { HOST_XDG_ENV, snapshotHostXdg } from '../core/hostenv';
 import { VllmClient } from '../vllm/client';
 import { log, logError } from '../logger';
 import { OpencodeClient } from './client';
@@ -215,11 +217,21 @@ export class OpencodeServerManager {
     } catch (err) {
       logError('could not create opencode data dir', err);
     }
+    // Snapshot the host's XDG values before ours replace them, so the bundled
+    // plugin can hand them back to the commands the agent runs.
+    const hostXdg = JSON.stringify(snapshotHostXdg(process.env));
     return {
       ...process.env,
       OPENCODE_CONFIG_CONTENT: configContent,
       NO_COLOR: '1',
+      [HOST_XDG_ENV]: hostXdg,
       // Sandbox all on-disk state to our managed dir.
+      //
+      // These are inherited by every process the agent's `bash` tool spawns,
+      // where they break XDG-respecting CLIs (`gh auth status` reports "not
+      // logged in", `helm` loses its repo config). `opencode-plugin/
+      // xdg-passthrough.js` restores the snapshot above for those children;
+      // see src/core/hostenv.ts.
       XDG_DATA_HOME: sub('data'),
       XDG_CONFIG_HOME: sub('config'),
       XDG_CACHE_HOME: sub('cache'),
@@ -265,8 +277,11 @@ export class OpencodeServerManager {
     // counts (drives the meter). vLLM needs no auth by default; an `apiKey` is
     // forwarded only when the user configured one (server started with
     // --api-key).
+    const pluginUrl = this.xdgPluginUrl();
     const config = {
       $schema: 'https://opencode.ai/config.json',
+      // Hands the host's real XDG_* values back to the agent's shell commands.
+      ...(pluginUrl ? { plugin: [pluginUrl] } : {}),
       // Let the model ask the user clarifying questions via the built-in
       // `question` tool. "allow" surfaces the picker immediately (the picker is
       // the interaction; no redundant approval gate). The bridge relays the
@@ -290,6 +305,22 @@ export class OpencodeServerManager {
       },
     };
     return JSON.stringify(config);
+  }
+
+  /**
+   * `file://` URL of the bundled `shell.env` plugin, or null when it is missing
+   * (corrupt install / a packaging change that dropped it). Returning null just
+   * means shell commands keep the pinned XDG values — the pre-fix behaviour —
+   * and a plugin that fails to load is likewise non-fatal: verified that a
+   * syntactically broken plugin still leaves the server serving requests.
+   */
+  private xdgPluginUrl(): string | null {
+    const p = path.join(this.extensionPath, 'opencode-plugin', 'xdg-passthrough.js');
+    if (!fs.existsSync(p)) {
+      logError('xdg passthrough plugin missing; agent shell commands keep pinned XDG dirs', p);
+      return null;
+    }
+    return pathToFileURL(p).href;
   }
 
   /** Absolute path to the binary bundled inside the VSIX (if present). */
