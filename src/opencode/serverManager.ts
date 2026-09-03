@@ -7,7 +7,9 @@ import * as vscode from 'vscode';
 import { ExtensionConfig, getConfig } from '../config';
 import { resolveBinaryPath } from '../core/binary';
 import { clampContext } from '../core/context';
-import { HOST_XDG_ENV, snapshotHostXdg } from '../core/hostenv';
+import { HOST_XDG_ENV, hostXdgForChildren, snapshotHostXdg, withHostXdg } from '../core/hostenv';
+import { augmentedPath } from '../core/mcp';
+import { discoverMcpServers } from '../mcp/discovery';
 import { VllmClient } from '../vllm/client';
 import { log, logError } from '../logger';
 import { OpencodeClient } from './client';
@@ -225,6 +227,11 @@ export class OpencodeServerManager {
       OPENCODE_CONFIG_CONTENT: configContent,
       NO_COLOR: '1',
       [HOST_XDG_ENV]: hostXdg,
+      // Augment PATH so stdio MCP servers (command: ["npx"/"uvx"/...]) can be
+      // spawned even when VS Code was launched from a GUI context, which hands
+      // the extension host a minimal PATH — the single most common reason an
+      // npx-based MCP server fails to start.
+      PATH: augmentedPath(process.env.PATH, os.homedir(), path.delimiter),
       // Sandbox all on-disk state to our managed dir.
       //
       // These are inherited by every process the agent's `bash` tool spawns,
@@ -277,9 +284,30 @@ export class OpencodeServerManager {
     // counts (drives the meter). vLLM needs no auth by default; an `apiKey` is
     // forwarded only when the user configured one (server started with
     // --api-key).
+    // MCP servers discovered from .mcp.json / .vscode/mcp.json / VS Code user
+    // settings / our own `vllmCode.mcpServers`. Tokens like ${VAR} are already
+    // resolved to literals (OPENCODE_CONFIG_CONTENT is not substituted by
+    // OpenCode), so what we inject is ready to spawn as-is. Their tools flow
+    // through OpenCode's existing tool-call + permission machinery for free.
+    let mcp: ReturnType<typeof discoverMcpServers>['map'] = {};
+    try {
+      // stdio servers are spawned by OpenCode and would otherwise inherit the
+      // pinned XDG dirs the same way shell commands do; the `shell.env` plugin
+      // does not reach them, so hand the values over per-server instead.
+      mcp = withHostXdg(
+        discoverMcpServers().map,
+        hostXdgForChildren(process.env, os.homedir(), path.join),
+      );
+    } catch (err) {
+      logError('could not discover MCP servers', err);
+    }
+
     const pluginUrl = this.xdgPluginUrl();
     const config = {
       $schema: 'https://opencode.ai/config.json',
+      // Servers the user already declared for Claude Code / VS Code Copilot,
+      // plus our own setting. Omitted entirely when nothing is configured.
+      ...(Object.keys(mcp).length ? { mcp } : {}),
       // Hands the host's real XDG_* values back to the agent's shell commands.
       ...(pluginUrl ? { plugin: [pluginUrl] } : {}),
       // Let the model ask the user clarifying questions via the built-in

@@ -22,6 +22,11 @@ media/vllm-logo.svg
 media/screenshots/**
 releasenotes/**
 *HANDOFF.md
+# Internal/working docs: only README.md ships. Without this, ANY root markdown
+# (prototype status, design notes, parity reports) lands in the .vsix on the
+# Marketplace — PROTOTYPE-STATUS.md was doing exactly that.
+*.md
+!README.md
 sample-workspace/**
 
 # Local agent/tool config and generated code-graph output. These are untracked,
