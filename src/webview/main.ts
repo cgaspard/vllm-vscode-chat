@@ -438,15 +438,36 @@ function renderActiveFile(): void {
     : `${state.activeFile.path} excluded — click to include as context`;
 }
 
+/**
+ * Image formats the server side can actually decode.
+ *
+ * OpenCode hands the raw bytes to a photon/WASM decoder (the Rust `image`
+ * crate) and ignores the declared mime entirely, so anything outside this list
+ * dies there with an opaque `ImageDecodeError` and a stack trace in the chat.
+ * SVG and HEIC are the easy accidents on macOS — both satisfy a naive
+ * `image/*` test, neither is decodable.
+ */
+const DECODABLE_IMAGE = /^image\/(png|jpeg|jpg|gif|webp|bmp|tiff?|x-icon|vnd\.microsoft\.icon)$/i;
+
 function addImage(file: File): Promise<void> {
   return new Promise((resolve) => {
     const reader = new FileReader();
     reader.onload = () => {
-      state.pendingImages.push({
-        mime: file.type || 'image/png',
-        dataUrl: String(reader.result),
-        name: file.name || 'pasted-image',
-      });
+      const dataUrl = String(reader.result);
+      // Take the type from the data URL, which is what the browser actually
+      // detected. `file.type` is empty for plenty of drops, and defaulting that
+      // to 'image/png' (as this used to) stamped a non-image as a PNG — which
+      // is precisely what got it past the server's `image/*` gate and into a
+      // decoder that then choked on it.
+      const mime = /^data:([^;,]+)/.exec(dataUrl)?.[1] ?? file.type ?? '';
+      if (!DECODABLE_IMAGE.test(mime)) {
+        setStatus(
+          `${file.name || 'That file'} is ${mime || 'of unknown type'} — not an image format that can be sent.`,
+          'warn',
+        );
+        return resolve();
+      }
+      state.pendingImages.push({ mime, dataUrl, name: file.name || 'pasted-image' });
       renderThumbs();
       resolve();
     };
