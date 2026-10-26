@@ -66,7 +66,12 @@ export class ChatBridge {
     });
     // Closing a tab is the one way the tracked file goes stale silently — see
     // pruneClosedContext.
-    this.tabsSub = vscode.window.tabGroups.onDidChangeTabs(() => this.pruneClosedContext());
+    this.tabsSub = vscode.Disposable.from(
+      vscode.window.tabGroups.onDidChangeTabs(() => this.pruneClosedContext()),
+      // A tab-change event can arrive while the closing editor is still listed
+      // as visible; the visible-editors change that follows settles it.
+      vscode.window.onDidChangeVisibleTextEditors(() => this.pruneClosedContext()),
+    );
   }
 
   dispose(): void {

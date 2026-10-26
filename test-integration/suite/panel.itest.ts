@@ -46,6 +46,28 @@ describe('panel: vLLM UI', function () {
     assert.match(String(await attr('#conn-banner', 'class')), /hidden/);
   });
 
+  it('the server menu lists servers, adds one and switches', async () => {
+    const servers = [
+      { id: 'a', name: 'Local', url: 'http://127.0.0.1:8000/v1' },
+      { id: 'b', name: 'GPU box', url: 'http://10.0.0.5:8000/v1' },
+    ];
+    await post({ type: 'servers', servers, activeId: 'b', connected: true });
+    assert.strictEqual(await text('#server-name'), 'GPU box');
+    assert.ok(await click('#server-btn'));
+    await waitFor('#server-menu:not(.hidden)', (n) => n === 1);
+    await post({ type: 'servers', servers, activeId: 'b', connected: true }); // the host answers listServers
+    assert.deepStrictEqual(await allText('#server-menu .model-row .model-name'), ['Local', 'GPU box ·  active']);
+    await helpers.setValue('#server-add-name', 'Third');
+    await helpers.setValue('#server-add-url', 'http://10.0.0.6:8000/v1');
+    assert.ok(await click('#server-add-btn'));
+    assert.deepStrictEqual((await posted('addServer')).at(-1), { type: 'addServer', name: 'Third', url: 'http://10.0.0.6:8000/v1' });
+    // The host answers addServer with its real list; switch to whichever row is not active.
+    await post({ type: 'servers', servers, activeId: 'b', connected: true });
+    assert.ok(await click('#server-menu .model-row', 0));
+    assert.deepStrictEqual((await posted('switchServer')).at(-1), { type: 'switchServer', id: 'a' });
+    assert.match(String(await attr('#server-menu', 'class')), /hidden/);
+  });
+
   it('a tool call renders as a card that expands to its output', async () => {
     await post(readyInit());
     await ev('message.updated', { info: { id: 'm1', sessionID: 's', role: 'assistant', time: { created: 1 } } });
