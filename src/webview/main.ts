@@ -928,6 +928,12 @@ function enhanceCode(container: HTMLElement): void {
 }
 
 function upsertPart(part: Part): void {
+  // A compaction marker is not chat: the context meter flags the compaction
+  // (session.compacted) and the summary arrives as its own assistant turn.
+  // Drawing it would leave an empty bubble.
+  if (part.type === 'compaction') {
+    return;
+  }
   const role = roleByMessage.get(part.messageID) ?? 'assistant';
   const { partsEl } = ensureMessageEl(part.messageID, role);
   if (role !== 'user' && state.busy) {
@@ -1451,6 +1457,9 @@ function renderConversation(messages: MessageWithParts[]): void {
   clearConversation();
   let lastUsed = 0;
   for (const m of messages) {
+    if (m.parts.length > 0 && m.parts.every((p) => p.type === 'compaction')) {
+      continue; // a compaction marker (see upsertPart): no bubble of its own
+    }
     roleByMessage.set(m.info.id, m.info.role);
     ensureMessageEl(m.info.id, m.info.role);
     for (const part of m.parts) {

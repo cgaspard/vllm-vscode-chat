@@ -154,7 +154,24 @@ describe('panel: vLLM UI', function () {
 
   it('an automatic compaction is flagged on the context meter', async () => {
     await post(readyInit());
+    // What the translator emits live: the marker part alone, then the summary turn.
+    await ev('message.part.updated', { part: { id: 'c1:marker:part', sessionID: 's', messageID: 'c1:marker', type: 'compaction' } });
+    await ev('message.updated', { info: { id: 'c1', sessionID: 's', role: 'assistant', time: { created: 1 } } });
+    await ev('message.part.updated', { part: { id: 'c1:text:0', sessionID: 's', messageID: 'c1', type: 'text', text: 'Summary of the work' } });
     await ev('session.compacted', { sessionID: 's' });
     assert.match(String(await text('#ctx-meter .ctx-label')), /compacted/);
+    assert.strictEqual(await count('.msg'), 1, 'the marker draws no (empty) bubble');
+    assert.match(String(await text('.msg.assistant')), /Summary of the work/);
+    // The same pair reloaded from history.
+    await post({
+      type: 'sessionLoaded',
+      sessionID: 's',
+      title: 't',
+      messages: [
+        { info: { id: 'c1:marker', sessionID: 's', role: 'user', time: { created: 1 } }, parts: [{ id: 'c1:marker:part', sessionID: 's', messageID: 'c1:marker', type: 'compaction' }] },
+        { info: { id: 'c1', sessionID: 's', role: 'assistant', time: { created: 1 } }, parts: [{ id: 'c1:text:0', sessionID: 's', messageID: 'c1', type: 'text', text: 'Summary of the work' }] },
+      ],
+    } as never);
+    assert.strictEqual(await count('.msg'), 1, 'a reloaded marker draws no bubble either');
   });
 });
