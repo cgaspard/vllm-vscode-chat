@@ -2,7 +2,9 @@
 // reasoning blocks and the Thinking toggle, and the context meter.
 import * as assert from 'node:assert';
 import * as fs from 'node:fs';
-import { assistantText, ask, freshChat, h, read, REASONING_MODEL, until, ws } from './lib';
+import * as path from 'node:path';
+import { FakeThinker, THINKER_MODEL } from './fakeThinker';
+import { ask, busy, freshChat, h, read, restoreServer, send, until, useServer, ws } from './lib';
 
 describe('e2e · the agent', function () {
   it('answers a prompt typed into the panel', async () => {
@@ -36,8 +38,28 @@ describe('e2e · the agent', function () {
 
   it('plan mode stays read-only', async () => {
     await freshChat({ agent: 'plan' });
-    await ask('Create a file named plan-should-not-write.txt containing hello.');
+    // v2's plan agent may write plan notes to ~/.opencode/plan, which is outside
+    // the workspace and so asks first: deny those (a test must not write into
+    // the real home directory) and let the turn finish.
+    await send('Create a file named plan-should-not-write.txt containing hello.');
+    await until(busy, 30_000, 'the turn to start').catch(() => undefined);
+    const asked: string[] = [];
+    await until(
+      async () => {
+        if ((await h.count('.perm-card:not(.resolved)')) > 0) {
+          asked.push(String(await h.text('.perm-card:not(.resolved) .perm-detail')));
+          await h.click('.perm-card:not(.resolved) .perm-btn.reject');
+        }
+        return !(await busy());
+      },
+      240_000,
+      'the turn to end',
+    );
     assert.ok(!fs.existsSync(ws('plan-should-not-write.txt')), 'the plan agent must not write files');
+    assert.ok(
+      asked.every((d) => d.includes(path.join('.opencode', 'plan'))),
+      `the only writes it may ask for are plan notes (asked: ${asked.join(' | ')})`,
+    );
   });
 
   it('streams markdown with code blocks', async () => {
@@ -49,17 +71,29 @@ describe('e2e · the agent', function () {
   });
 
   it('a reasoning model shows its thinking, and the Thinking toggle hides it', async () => {
-    await freshChat({ model: REASONING_MODEL });
-    if (/off/.test(String(await h.attr('#btn-think', 'title')))) {
+    // A scripted vLLM-shaped server that streams reasoning_content before its
+    // answer: proves the whole thinking path without a large reasoning model.
+    const fake = new FakeThinker();
+    await fake.start();
+    const back = String(await h.text('#server-name'));
+    const state = await useServer(fake.url, 'E2E thinker');
+    try {
+      await freshChat({ model: THINKER_MODEL });
+      if (/off/.test(String(await h.attr('#btn-think', 'title')))) {
+        await h.click('#btn-think');
+      }
+      const reply = await ask('What is 17 * 23?');
+      assert.match(reply, /391/);
+      await until(async () => (await h.count('.part-reasoning details.reasoning')) > 0, 10_000, 'the thinking block');
+      assert.match(String(await h.text('.part-reasoning')), /17 times 20/, 'the reasoning text streamed into the block');
       await h.click('#btn-think');
+      assert.match(String(await h.attr('body', 'class')), /hide-reasoning/, 'Thinking off hides reasoning');
+      await h.click('#btn-think');
+      assert.doesNotMatch(String(await h.attr('body', 'class')), /hide-reasoning/);
+    } finally {
+      await restoreServer(state, back);
+      await fake.stop();
     }
-    await ask('What is 17 * 23? Think it through, then answer with just the number.', 600_000);
-    assert.match(await assistantText(), /391/);
-    assert.ok((await h.count('.part-reasoning details.reasoning')) > 0, 'a thinking block rendered');
-    await h.click('#btn-think');
-    assert.match(String(await h.attr('body', 'class')), /hide-reasoning/, 'Thinking off hides reasoning');
-    await h.click('#btn-think');
-    assert.doesNotMatch(String(await h.attr('body', 'class')), /hide-reasoning/);
   });
 
   it('the context meter switches to real token counts', async () => {

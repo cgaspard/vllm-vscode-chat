@@ -5,8 +5,9 @@
 //   npm run test:e2e
 //
 // Needs a model server (default LM Studio at http://127.0.0.1:1234/v1) with a
-// tool-capable vision model; override with E2E_BASE_URL / E2E_MODEL, and the
-// reasoning model with E2E_REASONING_MODEL. Each run gets a fresh copy of
+// small tool-capable vision model (default qwen/qwen3-vl-4b); override with
+// E2E_BASE_URL / E2E_MODEL. The thinking test runs against a scripted
+// reasoning server (fakeThinker.ts), so no reasoning model is needed. Each run gets a fresh copy of
 // test-integration/e2e/workspace, so edits the agent makes never touch the repo.
 import * as fs from 'node:fs';
 import * as os from 'node:os';

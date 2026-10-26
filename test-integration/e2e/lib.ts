@@ -8,8 +8,9 @@ import * as h from '../suite/helpers';
 // vLLM speaks the OpenAI-compatible /v1 API; any server that does can stand in
 // for it (default: LM Studio, since vLLM needs a GPU host).
 export const BASE_URL = process.env.E2E_BASE_URL ?? 'http://127.0.0.1:1234/v1';
-export const MODEL = process.env.E2E_MODEL ?? 'qwen3-vl-30b-a3b-instruct-mlx';
-export const REASONING_MODEL = process.env.E2E_REASONING_MODEL ?? 'qwen/qwen3.8-27b';
+// One small model for everything (the model server is shared; keep loads
+// down). Reasoning is proven against a scripted server (fakeThinker.ts).
+export const MODEL = process.env.E2E_MODEL ?? 'qwen/qwen3-vl-4b';
 export const WORKSPACE = process.env.E2E_WORKSPACE ?? '';
 
 export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -45,6 +46,31 @@ export async function connect(): Promise<void> {
   connected = true;
 }
 
+export interface ServerState {
+  id: string;
+  previous: string;
+}
+
+/**
+ * Make `url` the panel's model server (e.g. a scripted fake). The seam adds the
+ * server and stops the engine (its provider is baked in at start); the panel
+ * then switches to it the way its server menu does.
+ */
+export async function useServer(url: string, name: string): Promise<ServerState> {
+  const state = (await vscode.commands.executeCommand('vllmCode._test.useServer', url, name)) as ServerState;
+  await h.postToHost({ type: 'switchServer', id: state.id });
+  await until(async () => String(await h.text('#server-name')) === name, 30_000, `the switch to ${name}`);
+  return state;
+}
+
+/** Undo useServer: back to the previous server, and drop the added one. */
+export async function restoreServer(state: ServerState, name: string): Promise<void> {
+  await until(async () => !(await busy()), 60_000, 'the turn to settle before switching back');
+  await h.postToHost({ type: 'switchServer', id: state.previous });
+  await until(async () => String(await h.text('#server-name')) === name, 30_000, `the switch back to ${name}`);
+  await vscode.commands.executeCommand('vllmCode._test.restoreServer', state);
+}
+
 /** Pick a model through the panel's model menu, as a user clicks it. */
 export async function pickModel(model: string): Promise<void> {
   if (String(await h.text('#model-btn .model-btn-label')).startsWith(shortName(model))) {
@@ -62,7 +88,16 @@ export async function pickModel(model: string): Promise<void> {
 /** A clean conversation on `model` (default MODEL) with `agent` (default build). */
 export async function freshChat(opts: { model?: string; agent?: 'build' | 'plan' } = {}): Promise<void> {
   await connect();
-  await until(async () => !(await busy()), 120_000, 'the previous turn to settle');
+  // A turn left running by a failed test (e.g. waiting on an unanswered card)
+  // must not fail every test after it: give it time, then stop it.
+  const settled = await until(async () => !(await busy()), 60_000, 'the previous turn to settle').then(
+    () => true,
+    () => false,
+  );
+  if (!settled) {
+    await h.click('#send'); // the send button is the stop button while busy
+    await until(async () => !(await busy()), 30_000, 'the stuck turn to stop');
+  }
   // The editor-tab panel has no New chat button of its own (the toolbar
   // command targets the sidebar view); this is the message that command sends.
   await h.postToHost({ type: 'newChat' });
@@ -110,6 +145,7 @@ export async function panelState(): Promise<string> {
     `messages: ${(await h.allText('.msg')).map((t) => t.slice(0, 160)).join(' || ')}`,
     `errors: ${(await h.allText('.error-bubble')).join(' || ')}`,
     `cards: ${(await h.allText('.perm-card, .question-card')).map((t) => t.slice(0, 80)).join(' || ')}`,
+    `waiting on: ${(await h.allText('.perm-card:not(.resolved) .perm-head, .question-card:not(.resolved)')).map((t) => t.slice(0, 120)).join(' || ')}`,
     `banner: ${await h.text('#conn-banner')}`,
     `server: ${await h.text('#server-name')} (menu ${await h.attr('#server-menu', 'class')})`,
     `last posted: ${(await h.posted()).slice(-8).map((m) => JSON.stringify(m).slice(0, 90)).join(' ')}`,
