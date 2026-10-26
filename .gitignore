@@ -5,8 +5,12 @@ out-test/
 *.vsix
 .DS_Store
 .claude/scheduled_tasks.lock
-# Bundled OpenCode binary is fetched at package time, never committed.
-bin/
 
 # Graphoxide code-graph output, regenerated on demand.
 /graphoxide-out/
+
+# Embedded OpenCode engine, built by scripts/build-opencode-sdk.js at package time.
+/opencode-sdk/
+out-live/
+out-integration/
+.vscode-test/

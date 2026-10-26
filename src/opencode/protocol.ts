@@ -17,16 +17,114 @@ export interface Session {
   time: { created: number; updated: number };
 }
 
+/**
+ * One model as `GET /config/providers` describes it. Verified against OpenCode
+ * 1.18.4: every field here comes back for catalog models (Anthropic, OpenAI,
+ * Google, …) and the subset we declare comes back for local ones. Kept loose —
+ * a field the catalog adds later must never break parsing.
+ */
+export interface ProviderModelInfo {
+  id?: string;
+  name?: string;
+  family?: string;
+  capabilities?: {
+    reasoning?: boolean;
+    toolcall?: boolean;
+    attachment?: boolean;
+    temperature?: boolean;
+    input?: { text?: boolean; image?: boolean; audio?: boolean; pdf?: boolean; video?: boolean };
+    output?: { text?: boolean; image?: boolean; audio?: boolean };
+  };
+  /** USD per million tokens. */
+  cost?: { input?: number; output?: number; cache?: { read?: number; write?: number } };
+  limit?: { context?: number; input?: number; output?: number };
+  /**
+   * The model's own reasoning-effort variants, keyed by the name to send as
+   * `PromptBody.variant` — e.g. Anthropic low/medium/high/max, OpenAI
+   * medium/high/xhigh. Absent on models with no selectable reasoning.
+   */
+  variants?: Record<string, unknown>;
+  status?: string;
+  release_date?: string;
+}
+
 export interface ProviderInfo {
   id: string;
   name: string;
-  models: Record<string, { name?: string }>;
+  /** Where the credentials came from: 'config' (ours), 'env', 'custom', … */
+  source?: string;
+  /** Env var names this provider would also read a key from. */
+  env?: string[];
+  models: Record<string, ProviderModelInfo>;
 }
 
+/**
+ * `GET /config/providers`. Returns ONLY providers that are credentialed —
+ * verified: a bare config returns just OpenCode's builtin. So this is the
+ * authority on "what can I use right now", never on "what could I add" (that
+ * is the models.dev catalog; see src/providers/catalog.ts).
+ */
 export interface ProvidersResponse {
   providers: ProviderInfo[];
+  /** Each provider's default model id, keyed by provider id. */
   default: Record<string, string>;
 }
+
+// ---- MCP status ----------------------------------------------------------
+// `GET /mcp` returns a map of server name -> live connection state. Observed
+// shapes from OpenCode 1.16.x: { status: 'connected' | 'disabled' | 'failed',
+// error?: string }. We keep it loose so an added field never breaks parsing.
+
+export type McpServerStatus = 'connected' | 'disabled' | 'failed' | 'pending' | string;
+
+export interface McpServerState {
+  status: McpServerStatus;
+  error?: string;
+  [k: string]: unknown;
+}
+
+/** Map of MCP server name -> its current connection state. */
+export type McpStatusResponse = Record<string, McpServerState>;
+
+// ---- Skills --------------------------------------------------------------
+// `GET /skill` returns the discovered skills. Shape (SkillV2Info): a list of
+// { name, description, location, content, slash? }. `location` is an absolute
+// SKILL.md path, or "<built-in>" for skills shipped with OpenCode. Skills are
+// discovered from disk: <project>/.opencode/skill, <project>/.claude/skills,
+// and ~/.claude/skills (Claude Code compatible), plus built-ins.
+
+export interface SkillInfo {
+  name: string;
+  description: string;
+  /** Absolute path to the SKILL.md, or "<built-in>". */
+  location: string;
+  /** The SKILL.md body (frontmatter stripped). */
+  content: string;
+  /** Whether the skill is also registered as a slash command. */
+  slash?: boolean;
+  [k: string]: unknown;
+}
+
+export type SkillsResponse = SkillInfo[];
+
+// ---- Commands ------------------------------------------------------------
+// `GET /command` returns BOTH user/built-in commands and skills as a unified
+// list; the `source` field discriminates ("command" vs "skill"). A command is
+// run with `POST /session/{id}/command` { command, arguments?, agent?, model? }.
+
+export interface CommandInfo {
+  name: string;
+  description?: string;
+  /** "command" for slash commands, "skill" for skills surfaced as commands. */
+  source?: 'command' | 'skill' | string;
+  /** Whether the command runs as a subtask (subagent). */
+  subtask?: boolean;
+  /** Argument placeholders the template expects (e.g. ["$ARGUMENTS"]). */
+  hints?: string[];
+  [k: string]: unknown;
+}
+
+export type CommandsResponse = CommandInfo[];
 
 // ---- Message parts -------------------------------------------------------
 
@@ -187,10 +285,39 @@ export interface FilePartInputSource {
   text: { value: string; start: number; end: number };
 }
 
+// `GET /agent` — every agent the server knows: built-ins plus anything
+// discovered from .opencode/agent/*.md, ~/.config/opencode/agent/, or the
+// injected config. `mode` decides the audience: 'primary' (user-pickable),
+// 'subagent' (delegation-only, via the task tool), or 'all' (both).
+export interface OpencodeAgent {
+  name: string;
+  description?: string;
+  mode?: 'primary' | 'subagent' | 'all' | string;
+  /** True for OpenCode's own built-ins. */
+  native?: boolean;
+  /** Internal agents (title/summary/compaction) — never list these. */
+  hidden?: boolean;
+  model?: { providerID?: string; modelID?: string } | null;
+  tools?: Record<string, boolean>;
+  color?: string;
+  variant?: string;
+  [k: string]: unknown;
+}
+
+export type AgentsResponse = OpencodeAgent[];
+
 export interface PromptBody {
   model: ModelRef;
   agent?: string;
   system?: string;
+  /**
+   * Reasoning-effort variant name, matching a key we declared in the provider
+   * config (`off` | `low` | `medium` | `high`). Omit for the model's default.
+   * OpenCode resolves it to the variant's provider options — for LM Studio that
+   * lands on the wire as `reasoning_effort`. An unrecognized name is ignored
+   * silently rather than erroring.
+   */
+  variant?: string;
   parts: Array<
     | { type: 'text'; text: string }
     | { type: 'file'; mime: string; url: string; filename?: string; source?: FilePartInputSource }
