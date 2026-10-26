@@ -28,6 +28,7 @@ test('isConnectionError catches the many faces of a dropped connection', () => {
   assert.equal(isConnectionError(new Error('getaddrinfo ENOTFOUND host')), true);
   assert.equal(isConnectionError(new TypeError('terminated')), true); // undici cut stream
   assert.equal(isConnectionError({ data: { message: 'fetch failed' } }), true); // SSE error event
+  assert.equal(isConnectionError(new Error('OpenCode engine stopped')), true); // a stopped embedded engine
 });
 
 test('isConnectionError ignores real application errors and user aborts', () => {

@@ -8,8 +8,6 @@ export { normalizeServerUrl, vllmRestRoot };
 export interface ExtensionConfig {
   vllmBaseUrl: string; // OpenAI-compatible base, e.g. http://127.0.0.1:8000/v1
   apiKey: string; // optional bearer token for a secured vLLM server ('' = none)
-  opencodePath: string;
-  serverPort: number;
   defaultModel: string;
   agent: 'build' | 'plan';
   minContextLength: number;
@@ -27,8 +25,6 @@ export function getConfig(): ExtensionConfig {
   return {
     vllmBaseUrl: normalizeServerUrl(cfg.get<string>('serverUrl') ?? 'http://127.0.0.1:8000/v1'),
     apiKey: (cfg.get<string>('apiKey') ?? '').trim(),
-    opencodePath: (cfg.get<string>('opencodePath') ?? '').trim(),
-    serverPort: cfg.get<number>('serverPort') ?? 0,
     defaultModel: (cfg.get<string>('defaultModel') ?? '').trim(),
     agent: (cfg.get<string>('agent') as 'build' | 'plan') ?? 'build',
     minContextLength: cfg.get<number>('minContextLength') ?? 32768,

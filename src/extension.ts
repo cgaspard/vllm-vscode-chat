@@ -10,8 +10,13 @@ import { OpencodeServerManager } from './opencode/serverManager';
 import { BridgeDeps } from './panel/bridge';
 import { ChatViewProvider, openChatPanel } from './panel/chatViewProvider';
 import { ManagerPanel } from './panel/managerPanel';
+import { attachTestWebview, registerTestCommands } from './test-integration/testHook';
 import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
+
+// Injected by esbuild `define`: true in test builds, false (dead-code-stripped)
+// in production.
+declare const __TEST__: boolean;
 
 let server: OpencodeServerManager | undefined;
 let processManager: VllmProcessManager | undefined;
@@ -38,9 +43,9 @@ export function activate(context: vscode.ExtensionContext): void {
   processManager = new VllmProcessManager(resolverFromDetect(detect));
   const hf = new HfManager(detect.hf, resolveHfToken(cfg.hfToken));
 
-  // Bundled binary lives under the extension dir; the managed server's on-disk
-  // state is sandboxed under globalStorage so it never collides with a user's
-  // own OpenCode install.
+  // The embedded engine ships under the extension dir (opencode-sdk/); its
+  // on-disk state is sandboxed under globalStorage so it never collides with a
+  // user's own OpenCode install.
   const dataDir = vscode.Uri.joinPath(context.globalStorageUri, 'opencode').fsPath;
   server = new OpencodeServerManager(cfg, vllm, context.extensionPath, dataDir);
 
@@ -123,14 +128,58 @@ export function activate(context: vscode.ExtensionContext): void {
       if (
         e.affectsConfiguration('vllmCode.serverUrl') ||
         e.affectsConfiguration('vllmCode.apiKey') ||
-        e.affectsConfiguration('vllmCode.opencodePath') ||
-        e.affectsConfiguration('vllmCode.serverPort')
+        // MCP servers are baked into the engine's config when it starts.
+        e.affectsConfiguration('vllmCode.mcpServers') ||
+        e.affectsConfiguration('mcp')
       ) {
         log('relevant configuration changed; restarting server on next use');
         server?.dispose();
       }
     }),
   );
+
+  // Integration-test seam (stripped from production builds via __TEST__).
+  // Opens a chat panel on demand and exposes it to the test commands so the
+  // suites can drive + inspect the live webview.
+  if (__TEST__) {
+    registerTestCommands(context);
+    context.subscriptions.push(
+      vscode.commands.registerCommand('vllmCode._test.openPanel', () => {
+        const panel = openChatPanel(context.extensionUri, deps);
+        attachTestWebview(panel.webview);
+      }),
+      // Point the active server at an address nothing listens on, so a panel
+      // opened by a suite that injects its own state stays offline: a vLLM
+      // server reachable on the default port would otherwise post real model
+      // lists over the fixtures mid-assertion. Returns what restoreServer needs.
+      vscode.commands.registerCommand('vllmCode._test.quiesce', async () => {
+        const previous = servers.active().id;
+        const offline = 'http://127.0.0.1:9/v1';
+        const added = servers.list().find((s) => s.url === offline) ?? (await servers.add('Test (offline)', offline));
+        await servers.setActive(added.id);
+        server?.dispose();
+        return { id: added.id, previous };
+      }),
+      // Make `url` the active server (the e2e suites point it at a real
+      // OpenAI-compatible endpoint). The engine is recreated on next use so
+      // its config targets the new server.
+      vscode.commands.registerCommand('vllmCode._test.useServer', async (url: string, name = 'E2E') => {
+        const previous = servers.active().id;
+        const added = await servers.add(name, url);
+        await servers.setActive(added.id);
+        server?.dispose();
+        return { id: added.id, previous };
+      }),
+      vscode.commands.registerCommand(
+        'vllmCode._test.restoreServer',
+        async (state: { id: string; previous: string }) => {
+          await servers.setActive(state.previous);
+          await servers.remove(state.id);
+          server?.dispose();
+        },
+      ),
+    );
+  }
 }
 
 export function deactivate(): void {

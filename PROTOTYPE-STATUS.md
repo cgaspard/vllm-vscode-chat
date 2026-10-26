@@ -35,8 +35,10 @@ server (which couldn't run in the build environment — no GPU/Linux).
 
 ## Architecture (what changed vs. the Ollama fork)
 
-- **Chat** still runs through the bundled **OpenCode** agent, now via its `@ai-sdk/openai-compatible`
-  provider (`provider.vllm`) pointed at the server's `/v1` base — see `src/opencode/serverManager.ts`.
+- **Chat** runs through **OpenCode 2 embedded in-process** (`@opencode/sdk`), via its `@ai-sdk/openai-compatible`
+  provider pointed at the server's `/v1` base — see `src/opencode/serverManager.ts`. The panel's provider id
+  `vllm` is declared to the engine as `vllm-vscode-panel` (`src/core/providerIds.ts`): OpenCode 2's built-in
+  vLLM plugin owns the raw id and would override the declared models.
 - **Discovery** is `GET /v1/models` (`src/vllm/client.ts` + pure parser `src/core/vllmModels.ts`).
   No model pull/load/unload/keep_alive — those Ollama concepts don't exist in vLLM and were removed.
 - **New model-manager subsystem** (`src/vllm/`): `processManager.ts` (spawn/track `vllm serve`),
@@ -51,7 +53,7 @@ server (which couldn't run in the build environment — no GPU/Linux).
 
 ```bash
 npm install
-npm run bundle:opencode   # fetch the OpenCode binary into bin/ for your platform (needed for F5)
+npm run bundle:opencode-sdk   # build the embedded OpenCode engine into opencode-sdk/ (needed for F5)
 npm run compile
 npm test
 # F5 in VS Code → Extension Development Host

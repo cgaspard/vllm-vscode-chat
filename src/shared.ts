@@ -23,6 +23,18 @@ export interface UiServer {
 }
 
 // ---- Host -> Webview -----------------------------------------------------
+/** How a message sent while the agent is working reaches it. */
+export type UiDelivery = 'steer' | 'queue';
+
+/** A message sent while the agent was working that it has not picked up yet. */
+export interface UiInboxItem {
+  inboxID: string;
+  text: string;
+  delivery: UiDelivery;
+  /** Images/files riding along with the text. */
+  files: number;
+}
+
 export type HostToWebview =
   | {
       type: 'init';
@@ -41,6 +53,8 @@ export type HostToWebview =
   | { type: 'cleared' }
   | { type: 'event'; event: OpencodeEvent }
   | { type: 'busy'; busy: boolean }
+  /** The session's pending (undelivered) messages, sent when a session is shown. */
+  | { type: 'inbox'; items: UiInboxItem[] }
   | { type: 'activeFile'; path: string | null; chars: number }
   | { type: 'status'; text: string; kind?: 'info' | 'warn' | 'error' }
   | { type: 'command'; command: 'history' | 'newChat' | 'focusInput' }
@@ -55,7 +69,23 @@ export interface UiImage {
 
 export type WebviewToHost =
   | { type: 'ready' }
-  | { type: 'send'; text: string; thinking: boolean; images?: UiImage[]; includeActiveFile?: boolean }
+  | {
+      type: 'send';
+      text: string;
+      thinking: boolean;
+      images?: UiImage[];
+      includeActiveFile?: boolean;
+      /**
+       * Only matters while the agent is working: `steer` (Enter) injects the
+       * message at the agent's next step, `queue` (Alt+Enter) holds it until the
+       * current turn ends.
+       */
+      delivery?: UiDelivery;
+    }
+  /** Move a pending message between steering and the queue. */
+  | { type: 'inboxSetDelivery'; inboxID: string; delivery: UiDelivery }
+  /** Withdraw a pending message before the agent sees it. */
+  | { type: 'inboxCancel'; inboxID: string }
   | { type: 'selectModel'; modelID: string }
   | { type: 'refreshModels' }
   | { type: 'openManager' }

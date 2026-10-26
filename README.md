@@ -2,13 +2,13 @@
 
 An agentic coding panel for **your [vLLM](https://docs.vllm.ai) server** — a Claude Code / Codex–style chat experience backed by your own GPU.
 
-Under the hood it drives the open-source [**OpenCode**](https://opencode.ai) agent (Apache/MIT) as a headless server pointed at your vLLM server's OpenAI-compatible `/v1` endpoint. You get a real agent — file edits, shell tools, permissions, multi-step reasoning — running entirely against models you serve.
+Under the hood it runs the open-source [**OpenCode**](https://opencode.ai) agent (MIT) inside the extension, pointed at your vLLM server's OpenAI-compatible `/v1` endpoint. You get a real agent — file edits, shell tools, permissions, multi-step reasoning — running entirely against models you serve.
 
 It also ships a **Model Manager**: start/stop local `vllm serve` instances, download models from Hugging Face, and load/unload LoRA adapters at runtime.
 
 ## Why
 
-The official Claude Code and Codex VS Code extensions are **not open source**, so they can't be adapted to self-hosted models. OpenCode, by contrast, ships a headless server that speaks the OpenAI-compatible provider protocol — exactly what vLLM exposes. This extension wraps that server in a native chat panel, fills its model picker from your vLLM server's `/v1/models`, and adds a manager for the local vLLM lifecycle.
+The official Claude Code and Codex VS Code extensions are **not open source**, so they can't be adapted to self-hosted models. OpenCode, by contrast, is an embeddable agent that speaks the OpenAI-compatible provider protocol — exactly what vLLM exposes. This extension wraps it in a native chat panel, fills its model picker from your vLLM server's `/v1/models`, and adds a manager for the local vLLM lifecycle.
 
 ## Features
 
@@ -21,6 +21,7 @@ The official Claude Code and Codex VS Code extensions are **not open source**, s
 - **Multi-server** — register, switch, and remove vLLM servers (local, WSL, Docker, or remote GPU box); offline mode with a connection banner
 - **Context meter** (uses vLLM's real token usage), **thinking toggle**, **image attachments** for vision models, and the **open file** attached as excludable context
 - **Session history** — persistent, resumable, auto-named; delete one or clear all
+- **Steer it mid-flight** — type while the agent works: **Enter** hands your message to it at its next step, **⌥/Alt+Enter** queues it for when the turn finishes
 
 ## Requirements
 
@@ -28,7 +29,15 @@ The official Claude Code and Codex VS Code extensions are **not open source**, s
 - **A reachable [vLLM](https://docs.vllm.ai) server** exposing its OpenAI-compatible API (default `http://127.0.0.1:8000/v1`). vLLM runs on **Linux / WSL / Docker** (and macOS via Docker Model Runner); it has no native Windows build. On Windows/macOS, run vLLM in WSL/Docker or on a remote GPU box and point the extension at its URL — the chat panel works as a pure client on every platform.
 - **Optional, for the local Model Manager:** a `vllm` install (or `python -m vllm`) and the Hugging Face CLI (`pip install -U "huggingface_hub[cli]"`) on the same machine as VS Code.
 
-> **[OpenCode](https://opencode.ai) is bundled** — the matching platform binary ships inside the extension, so there's nothing extra to install and it works offline. Power users can point at their own build with `vllmCode.opencodePath`. An OpenCode install elsewhere on your machine is never picked up automatically — the panel always runs the version it was tested with (OpenCode 2 is not supported yet).
+> **[OpenCode](https://opencode.ai) 2 runs inside the extension** — there is no separate server to install, start or stop, no port, and nothing left running when VS Code closes. An OpenCode install elsewhere on your machine (yours, Homebrew's) is never used and never affected: the panel keeps its own sessions and settings, and chats from earlier versions carry over.
+>
+> OpenCode is MIT-licensed by [anomalyco/opencode](https://github.com/anomalyco/opencode); its notice ships with the extension as `opencode-sdk/LICENSE.opencode`. This extension is an independent project and is not affiliated with or endorsed by the OpenCode maintainers.
+
+## Steer it mid-flight
+
+Type while the agent is working and hit **Enter** — your message is handed to it at its next step, so it adjusts work already in progress instead of you stopping and starting over. Hit **⌥/Alt+Enter** instead to **queue** it for when the current turn finishes.
+
+Messages waiting to be picked up sit above the composer, marked *Steering* or *Queued*: switch one between the two, or cancel it before the agent ever sees it. Each lands in the conversation at the moment the agent actually reads it, so the transcript stays in the order the model saw things. The stop button still stops.
 
 ## Quick start
 
@@ -46,8 +55,6 @@ To manage models locally, run **vLLM Code: Manage Local Models** (toolbar button
 | --- | --- | --- |
 | `vllmCode.serverUrl` | `http://127.0.0.1:8000/v1` | OpenAI-compatible vLLM base URL (`/v1` added if omitted) |
 | `vllmCode.apiKey` | _(none)_ | Bearer token for a server started with `--api-key` |
-| `vllmCode.opencodePath` | _(bundled)_ | Override path to an `opencode` 1.x binary; empty uses the bundled one |
-| `vllmCode.serverPort` | `0` | Embedded OpenCode server port (0 = auto) |
 | `vllmCode.defaultModel` | _(first)_ | Default model id (must match `/v1/models`) |
 | `vllmCode.agent` | `build` | `build` (can edit) or `plan` (read-only) |
 | `vllmCode.minContextLength` | `32768` | OpenCode compaction budget + meter denominator (clamped to the model's `--max-model-len`) |
@@ -88,17 +95,23 @@ runtime base-model swap — so "managing models" means managing **instances**,
 
 ```bash
 npm install
-npm run bundle:opencode      # fetch the pinned OpenCode binary into bin/ for your platform
+npm run bundle:opencode-sdk  # build the embedded OpenCode engine into opencode-sdk/ for your platform
 npm run compile              # type-check + bundle (extension + webview)
-npm test                     # run the unit suite
 # then press F5 in VS Code to launch the Extension Development Host
-npm run package:vsix:bundled # build a platform .vsix with the binary embedded
+npm test                     # unit tests
+npm run test:integration     # drives the real webview in a VS Code instance
+npm run test:live            # the engine against a model server (default LM Studio on :1234; any OpenAI-compatible /v1)
+npm run test:e2e             # the whole panel against a real model, through the UI
+npm run package:vsix:bundled # build a platform .vsix with the engine embedded
 ```
 
-The OpenCode binary is fetched at build time (pinned by `opencodeVersion` in
-`package.json`) and is never committed — `bin/` is git-ignored. Bump that field
-to upgrade the bundled OpenCode. F5 also resolves the binary from `bin/`, so run
-`bundle:opencode` once before launching the dev host.
+The engine is built from `@opencode/sdk`, pinned to an exact version in
+`devDependencies` — its API is still marked experimental, so upgrades are
+deliberate. `opencode-sdk/` is generated and git-ignored; run
+`bundle:opencode-sdk` once before launching the dev host, and again after
+changing the pinned version. The live and e2e suites default to LM Studio's
+OpenAI-compatible endpoint as a stand-in for vLLM (override with
+`LIVE_BASE_URL` / `E2E_BASE_URL` and `LIVE_MODEL` / `E2E_MODEL`).
 
 ## License
 

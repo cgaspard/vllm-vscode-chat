@@ -2,14 +2,14 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { getConfig } from '../config';
-import { humanizeError } from '../core/errors';
+import { humanizeError, isConnectionError } from '../core/errors';
 import { ServerRegistry } from '../connection';
 import { VllmClient, VllmModel } from '../vllm/client';
-import { logError } from '../logger';
-import { OpencodeClient } from '../opencode/client';
+import { log, logError } from '../logger';
 import { OpencodeEvent, PromptBody } from '../opencode/protocol';
-import { OpencodeServerManager } from '../opencode/serverManager';
-import { HostToWebview, UiImage, UiModel, UiSession, WebviewToHost } from '../shared';
+import { OpencodeServerManager, VLLM_PROVIDER_ID } from '../opencode/serverManager';
+import { OpencodeV2Client } from '../opencode/v2client';
+import { HostToWebview, UiDelivery, UiImage, UiModel, UiSession, WebviewToHost } from '../shared';
 
 export interface BridgeDeps {
   context: vscode.ExtensionContext;
@@ -30,7 +30,13 @@ const MODEL_KEY = 'vllmCode.model';
  * model-manager panel.
  */
 export class ChatBridge {
-  private client: OpencodeClient | undefined;
+  private client: OpencodeV2Client | undefined;
+  /**
+   * The client the live event stream is bound to. When the engine is
+   * restarted (a settings change, "Restart OpenCode Server", a server switch)
+   * the bridge re-subscribes on the new one.
+   */
+  private streamingClient: OpencodeV2Client | undefined;
   private currentSessionID: string | null = null;
   private currentModel: string | null = null;
   private agent: 'build' | 'plan';
@@ -96,6 +102,8 @@ export class ChatBridge {
       }
       if (ok && !this.connected) {
         await this.init(); // came online → full setup + model load
+      } else if (ok && this.connected && this.isStale()) {
+        await this.reattach(); // the engine was restarted or stopped under us
       } else if (ok && this.connected) {
         if (++this.healthTicks % 3 === 0) {
           await this.refreshModelsToWebview().catch(() => undefined); // ~every 15s
@@ -197,12 +205,31 @@ export class ChatBridge {
       return;
     }
     try {
+      if (msg.type !== 'ready' && msg.type !== 'retryConnect' && this.isStale()) {
+        await this.reattach();
+      }
       switch (msg.type) {
         case 'ready':
           await this.init();
           break;
         case 'send':
-          await this.handleSend(msg.text, msg.thinking, msg.images ?? [], msg.includeActiveFile ?? false);
+          await this.handleSend(
+            msg.text,
+            msg.thinking,
+            msg.images ?? [],
+            msg.includeActiveFile ?? false,
+            msg.delivery ?? 'steer',
+          );
+          break;
+        case 'inboxSetDelivery':
+          if (this.currentSessionID) {
+            await this.client?.setDelivery(this.currentSessionID, msg.inboxID, msg.delivery);
+          }
+          break;
+        case 'inboxCancel':
+          if (this.currentSessionID) {
+            await this.client?.cancelPending(this.currentSessionID, msg.inboxID);
+          }
           break;
         case 'selectModel':
           this.currentModel = msg.modelID;
@@ -354,6 +381,13 @@ export class ChatBridge {
       });
       return;
     }
+    // A restarted engine is a new client: the old event stream is bound to the
+    // stopped one, and startEventStream() would no-op while it is still set.
+    if (this.streamingClient && this.streamingClient !== started.client) {
+      this.eventAbort?.abort();
+      this.eventAbort = undefined;
+      this.streamingClient = undefined;
+    }
     this.client = started.client;
 
     const models = await this.loadModels();
@@ -440,6 +474,7 @@ export class ChatBridge {
     await this.deps.servers.setActive(id);
     this.eventAbort?.abort();
     this.eventAbort = undefined;
+    this.streamingClient = undefined;
     this.client = undefined;
     this.currentSessionID = null;
     this.deps.server.dispose();
@@ -526,6 +561,7 @@ export class ChatBridge {
     const title = sessions.find((s) => s.id === sessionID)?.title ?? 'Chat';
     this.updateTitle(title);
     this.post({ type: 'sessionLoaded', sessionID, title, messages });
+    this.postInbox();
   }
 
   private async handleSend(
@@ -533,6 +569,7 @@ export class ChatBridge {
     thinking: boolean,
     images: UiImage[],
     includeActiveFile: boolean,
+    delivery: UiDelivery = 'steer',
   ): Promise<void> {
     if (!this.client) {
       throw new Error('OpenCode server is not running.');
@@ -588,11 +625,12 @@ export class ChatBridge {
     }
 
     this.post({ type: 'busy', busy: true });
-    await this.client.promptAsync(this.currentSessionID!, {
-      model: { providerID: 'vllm', modelID: this.currentModel },
+    await this.sendPrompt({
+      model: { providerID: VLLM_PROVIDER_ID, modelID: this.currentModel },
       agent: this.agent,
       ...(system ? { system } : {}),
       parts,
+      delivery,
     });
 
     // Auto-name the session from the first user prompt.
@@ -610,10 +648,54 @@ export class ChatBridge {
     }
   }
 
+  /**
+   * Send a prompt. If the engine was stopped under us (a restart or settings
+   * change), re-attach to the new one and retry once before surfacing an error.
+   */
+  private async sendPrompt(body: PromptBody & { delivery?: UiDelivery }): Promise<void> {
+    try {
+      await this.client!.promptAsync(this.currentSessionID!, body);
+    } catch (err) {
+      if (!isConnectionError(err)) {
+        throw err;
+      }
+      logError('prompt failed on a connection error — reconnecting and retrying', err);
+      this.post({ type: 'status', text: 'Reconnecting…', kind: 'warn' });
+      await this.reattach();
+      if (!this.client || !this.currentSessionID) {
+        throw err;
+      }
+      await this.client.promptAsync(this.currentSessionID, body);
+      this.post({ type: 'status', text: '' });
+    }
+  }
+
+  /** True when this panel holds an engine client that is no longer the live one. */
+  private isStale(): boolean {
+    return !!this.client && this.client !== this.deps.server.currentClient;
+  }
+
+  /**
+   * Re-attach to the (possibly new) engine: init starts it if needed, swaps the
+   * client and re-subscribes the event stream. The current session is kept.
+   */
+  private async reattach(): Promise<void> {
+    log('engine changed under this panel — re-attaching');
+    if (this.connecting) {
+      // Another init is already doing this; wait for it to settle.
+      for (let i = 0; i < 300 && this.connecting; i++) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      return;
+    }
+    await this.init();
+  }
+
   private startEventStream(): void {
     if (this.eventAbort || !this.client) {
       return;
     }
+    this.streamingClient = this.client;
     this.eventAbort = new AbortController();
     void this.client.subscribeEvents((event) => this.relayEvent(event), this.eventAbort.signal);
   }
@@ -628,6 +710,16 @@ export class ChatBridge {
       return;
     }
     this.post({ type: 'event', event });
+  }
+
+  /** Send the current session's pending (not yet delivered) messages to the webview. */
+  private postInbox(): void {
+    const sid = this.currentSessionID;
+    const items = sid && this.client ? this.client.pendingInbox(sid) : [];
+    this.post({
+      type: 'inbox',
+      items: items.map(({ inboxID, text, delivery, files }) => ({ inboxID, text, delivery, files })),
+    });
   }
 
   private async openFile(p: string): Promise<void> {

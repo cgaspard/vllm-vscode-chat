@@ -2,7 +2,7 @@ import { marked } from 'marked';
 import { computeWindow, formatTokens } from '../core/context';
 import { buildAnswers, isEmptyAnswer, parseQuestionBlob, QInfo } from '../core/question';
 import type { MessageWithParts, OpencodeEvent, Part } from '../opencode/protocol';
-import type { HostToWebview, UiImage, UiModel, UiServer, UiSession, WebviewToHost } from '../shared';
+import type { HostToWebview, UiDelivery, UiImage, UiInboxItem, UiModel, UiServer, UiSession, WebviewToHost } from '../shared';
 
 declare function acquireVsCodeApi(): {
   postMessage(msg: unknown): void;
@@ -10,8 +10,17 @@ declare function acquireVsCodeApi(): {
   setState(s: unknown): void;
 };
 
+declare const __TEST__: boolean;
+
 const vscode = acquireVsCodeApi();
+/** Under __TEST__ only: the most recent messages posted to the host, for assertions. */
+const postedForTest: WebviewToHost[] = [];
+
 function post(msg: WebviewToHost): void {
+  if (__TEST__) {
+    postedForTest.push(msg);
+    postedForTest.splice(0, Math.max(0, postedForTest.length - 50));
+  }
   vscode.postMessage(msg);
 }
 
@@ -143,9 +152,10 @@ function build(): void {
       <span class="ctx-label"></span>
     </div>
     <div class="composer">
+      <div id="inbox-strip" class="inbox-strip hidden" aria-live="polite"></div>
       <div class="composer-box">
         <div id="thumbs" class="thumbs"></div>
-        <textarea id="input" rows="1" placeholder="Ask anything, paste an image, or describe a task…"></textarea>
+        <textarea id="input" rows="1" placeholder="${IDLE_PLACEHOLDER}"></textarea>
         <div class="composer-row">
           <div class="composer-tools">
             <button id="server-btn" class="tool-pill" title="vLLM server — switch / add">
@@ -262,13 +272,21 @@ function build(): void {
     }
   });
 
-  sendBtn.addEventListener('click', onSend);
+  sendBtn.addEventListener('click', () => {
+    // While the agent works the send button is the stop button.
+    if (state.busy) {
+      post({ type: 'abort' });
+      return;
+    }
+    onSend();
+  });
   inputEl.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      if (!state.busy) {
-        onSend();
-      }
+      // Runs while busy too: Enter with text STEERS the in-flight turn, and
+      // Alt+Enter QUEUES it for after the turn (onSend handles both); Enter on
+      // an empty box does nothing.
+      onSend(e.altKey ? 'queue' : 'steer');
     }
   });
   inputEl.addEventListener('input', autoGrow);
@@ -384,14 +402,25 @@ function autoGrow(): void {
 // ---------------------------------------------------------------------------
 // Sending
 // ---------------------------------------------------------------------------
-function onSend(): void {
-  if (state.busy) {
-    post({ type: 'abort' });
-    return;
-  }
+function onSend(delivery: UiDelivery = 'steer'): void {
   const text = inputEl.value.trim();
   if (!text && !state.pendingImages.length) {
     return;
+  }
+  if (state.busy) {
+    // Mid-turn: the message is handed to the agent at its next step (steer) or
+    // after the current turn (queue). It waits in the pending strip until the
+    // agent takes it; this one-shot note says which.
+    const notice =
+      delivery === 'queue'
+        ? 'Queued — it will run when the current turn finishes.'
+        : 'Steering — the agent will pick this up at its next step.';
+    setStatus(notice);
+    setTimeout(() => {
+      if (statusEl.textContent === notice) {
+        setStatus('');
+      }
+    }, 5000);
   }
   if (!state.connected) {
     setStatus('Not connected to vLLM — check the server banner above.', 'warn');
@@ -412,6 +441,7 @@ function onSend(): void {
     thinking: state.thinking,
     images,
     includeActiveFile: !!(state.activeFile && state.includeActiveFile),
+    delivery,
   });
 }
 
@@ -752,6 +782,7 @@ function renderMeter(): void {
 // Message + part rendering
 // ---------------------------------------------------------------------------
 function clearConversation(): void {
+  setInbox([]);
   messageEls.clear();
   partState.clear();
   roleByMessage.clear();
@@ -1332,8 +1363,12 @@ function setStatus(text: string, kind?: 'info' | 'warn' | 'error'): void {
   statusEl.className = `status ${kind ?? ''} ${text ? 'show' : ''}`;
 }
 
+const IDLE_PLACEHOLDER = 'Ask anything, paste an image, or describe a task…';
+const BUSY_PLACEHOLDER = 'Steer the agent — Enter to steer now, ⌥/Alt+Enter to queue for after this turn';
+
 function setBusy(busy: boolean): void {
   state.busy = busy;
+  inputEl.placeholder = busy ? BUSY_PLACEHOLDER : IDLE_PLACEHOLDER;
   sendBtn.innerHTML = busy ? icon.stop : icon.send;
   sendBtn.classList.toggle('busy', busy);
   if (busy) {
@@ -1439,6 +1474,74 @@ function renderConversation(messages: MessageWithParts[]): void {
 }
 
 // ---------------------------------------------------------------------------
+// Pending strip: messages sent while the agent works, until it picks them up
+// ---------------------------------------------------------------------------
+let inboxItems: UiInboxItem[] = [];
+/**
+ * A message sent to an idle agent is delivered within milliseconds; holding the
+ * render back briefly keeps it from flashing through the strip on every send.
+ */
+const INBOX_SHOW_DELAY_MS = 250;
+let inboxRenderTimer: ReturnType<typeof setTimeout> | undefined;
+
+function setInbox(items: UiInboxItem[]): void {
+  inboxItems = items.slice();
+  renderInbox();
+}
+
+function addInboxItem(item: UiInboxItem): void {
+  if (!item.inboxID || inboxItems.some((i) => i.inboxID === item.inboxID)) {
+    return;
+  }
+  inboxItems.push(item);
+  clearTimeout(inboxRenderTimer);
+  inboxRenderTimer = setTimeout(renderInbox, INBOX_SHOW_DELAY_MS);
+}
+
+function updateInboxItem(inboxID: string, delivery: UiDelivery): void {
+  const item = inboxItems.find((i) => i.inboxID === inboxID);
+  if (item) {
+    item.delivery = delivery;
+    renderInbox();
+  }
+}
+
+function removeInboxItem(inboxID: string): void {
+  const before = inboxItems.length;
+  inboxItems = inboxItems.filter((i) => i.inboxID !== inboxID);
+  if (inboxItems.length !== before) {
+    renderInbox();
+  }
+}
+
+function renderInbox(): void {
+  clearTimeout(inboxRenderTimer);
+  const strip = document.getElementById('inbox-strip')!;
+  strip.classList.toggle('hidden', inboxItems.length === 0);
+  strip.innerHTML = '';
+  for (const item of inboxItems) {
+    const steer = item.delivery === 'steer';
+    const row = document.createElement('div');
+    row.className = `inbox-item ${item.delivery}`;
+    const attach = item.files ? ` <span class="inbox-files">+${item.files} attachment${item.files === 1 ? '' : 's'}</span>` : '';
+    row.innerHTML = `
+      <span class="inbox-badge" title="${steer ? 'Picked up at the agent\'s next step' : 'Runs after the current turn finishes'}">${steer ? 'Steering' : 'Queued'}</span>
+      <span class="inbox-text" title="${escapeHtml(item.text)}">${escapeHtml(item.text)}${attach}</span>
+      <span class="inbox-actions">
+        <button class="inbox-btn inbox-toggle" title="${steer ? 'Hold it until the current turn finishes' : 'Hand it to the agent at its next step'}">${steer ? 'Queue instead' : 'Steer now'}</button>
+        <button class="inbox-btn inbox-cancel" title="Cancel — the agent never sees it">${icon.close}</button>
+      </span>`;
+    row.querySelector('.inbox-toggle')!.addEventListener('click', () => {
+      post({ type: 'inboxSetDelivery', inboxID: item.inboxID, delivery: steer ? 'queue' : 'steer' });
+    });
+    row.querySelector('.inbox-cancel')!.addEventListener('click', () => {
+      post({ type: 'inboxCancel', inboxID: item.inboxID });
+    });
+    strip.appendChild(row);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // OpenCode event handling
 // ---------------------------------------------------------------------------
 function handleEvent(event: OpencodeEvent): void {
@@ -1449,6 +1552,11 @@ function handleEvent(event: OpencodeEvent): void {
       if (info?.id) {
         roleByMessage.set(info.id, info.role);
         ensureMessageEl(info.id, info.role);
+        // A step starting means the agent is working — also when it picks up a
+        // queued message after the previous turn already went idle.
+        if (info.role === 'assistant' && !state.busy && info.time && !info.time.completed) {
+          setBusy(true);
+        }
         if (info.role === 'assistant' && info.tokens) {
           const used = tokensUsed(info.tokens);
           if (used > 0) {
@@ -1508,6 +1616,21 @@ function handleEvent(event: OpencodeEvent): void {
     case 'file.edited':
       // Subtle chip noting an edited file (deduped per render is not critical).
       break;
+    case 'inbox.enqueued':
+      addInboxItem({ inboxID: p.inboxID, text: p.text ?? '', delivery: p.delivery === 'queue' ? 'queue' : 'steer', files: p.files ?? 0 });
+      break;
+    case 'inbox.changed':
+      updateInboxItem(p.inboxID, p.delivery === 'queue' ? 'queue' : 'steer');
+      break;
+    case 'inbox.delivered':
+    case 'inbox.cancelled':
+      removeInboxItem(p.inboxID);
+      break;
+    case 'session.retry':
+      // The provider failed transiently and OpenCode is retrying the step:
+      // say so, or a stalled-looking turn reads as a hang.
+      showWorking(`Retrying (attempt ${p.attempt ?? 2})${p.message ? ` — ${p.message}` : ''}`);
+      break;
   }
 }
 
@@ -1549,6 +1672,9 @@ window.addEventListener('message', (e: MessageEvent<HostToWebview>) => {
       state.currentSessionID = msg.currentSessionID;
       renderHistory();
       break;
+    case 'inbox':
+      setInbox(msg.items);
+      break;
     case 'sessionLoaded':
       state.currentSessionID = msg.sessionID;
       renderConversation(msg.messages);
@@ -1588,7 +1714,100 @@ window.addEventListener('message', (e: MessageEvent<HostToWebview>) => {
 });
 
 // ---------------------------------------------------------------------------
+// Test hook (only compiled into non-production builds; see esbuild.js)
+// ---------------------------------------------------------------------------
+// Lets integration tests drive + inspect the webview over the postMessage
+// channel: { __test__: 'query', id, selector, prop } reads an element's text or
+// attribute; { __test__: 'click', id, selector, index? } dispatches a real click;
+// { __test__: 'posted', id, type? } returns what the webview posted. The result
+// is posted back as { __test__: 'result', id, ... }. No eval is exposed.
+function installTestHook(): void {
+  window.addEventListener('message', (e: MessageEvent<any>) => {
+    const m = e.data;
+    if (!m || m.__test__ === undefined || m.__test__ === 'result') {
+      return;
+    }
+    const reply = (payload: Record<string, unknown>) =>
+      vscode.postMessage({ __test__: 'result', id: m.id, ...payload } as never);
+    try {
+      if (m.__test__ === 'query') {
+        const els = Array.from(document.querySelectorAll(m.selector as string));
+        const read = (el: Element) =>
+          m.prop === 'text'
+            ? (el.textContent ?? '').trim()
+            : m.prop === 'class'
+              ? el.className
+              : m.prop === 'value'
+                ? ((el as HTMLInputElement).value ?? null)
+                : el.getAttribute(m.prop as string);
+        reply({ count: els.length, value: els[0] ? read(els[0]) : null, values: els.map(read) });
+      } else if (m.__test__ === 'click') {
+        // `index` picks the n-th match (default the first).
+        const el = document.querySelectorAll(m.selector as string)[Number(m.index ?? 0)] as HTMLElement | undefined;
+        if (el) {
+          el.click();
+        }
+        reply({ ok: !!el });
+      } else if (m.__test__ === 'posted') {
+        // Messages the webview sent to the host (newest last), optionally of
+        // one type — lets a test assert what a click asked the host to do.
+        const type = m.type as string | undefined;
+        reply({ messages: postedForTest.filter((x) => !type || x.type === type) });
+      } else if (m.__test__ === 'addImage') {
+        // Attach an image through the same path a paste or drop takes.
+        void fetch(String(m.dataUrl))
+          .then((r) => r.blob())
+          .then((blob) => addImage(new File([blob], String(m.name ?? 'image.png'), { type: blob.type })))
+          .then(() => reply({ ok: true, pending: state.pendingImages.length }));
+        return;
+      } else if (m.__test__ === 'postToHost') {
+        // Send a message exactly as one of the webview's own controls would.
+        post(m.message as WebviewToHost);
+        reply({ ok: true });
+      } else if (m.__test__ === 'keydown') {
+        // A real key event on an element (default: the composer), so tests can
+        // exercise shortcuts like Alt+Enter the way a user presses them.
+        const el = (m.selector ? document.querySelector(m.selector as string) : inputEl) as HTMLElement | null;
+        el?.dispatchEvent(
+          new KeyboardEvent('keydown', { key: String(m.key), altKey: !!m.altKey, shiftKey: !!m.shiftKey, bubbles: true, cancelable: true }),
+        );
+        reply({ ok: !!el });
+      } else if (m.__test__ === 'setInput') {
+        // Set the composer textarea value and fire the input event.
+        inputEl.value = String(m.value ?? '');
+        inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+        reply({ ok: true });
+      } else if (m.__test__ === 'setSelect') {
+        // Set a <select>'s value and fire change, the way a user picking an
+        // option would (click() can't open a native dropdown in tests).
+        const el = document.querySelector(m.selector as string) as HTMLSelectElement | null;
+        if (el) {
+          el.value = String(m.value ?? '');
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        reply({ ok: !!el });
+      } else if (m.__test__ === 'setValue') {
+        // Type into any input (e.g. the add-server fields).
+        const el = document.querySelector(m.selector as string) as HTMLInputElement | null;
+        if (el) {
+          el.value = String(m.value ?? '');
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        reply({ ok: !!el });
+      } else {
+        reply({ error: `unknown __test__ op: ${m.__test__}` });
+      }
+    } catch (err) {
+      reply({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------------
 build();
+if (__TEST__) {
+  installTestHook();
+}
 post({ type: 'ready' });

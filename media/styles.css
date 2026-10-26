@@ -1333,3 +1333,84 @@ body.hide-reasoning .part-reasoning {
 .history-del:hover {
   color: var(--vscode-errorForeground, #e35d6a);
 }
+
+/* Pending strip: messages sent while the agent works, until it picks them up.
+   Sits on top of the composer box, one row per message. */
+.inbox-strip {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0 8px;
+  padding: 6px 10px 10px;
+  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.28));
+  border-bottom: none;
+  border-radius: 12px 12px 0 0;
+  background: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.06));
+  margin-bottom: -6px; /* tuck under the composer box's top edge */
+  font-size: 12px;
+}
+.inbox-strip.hidden {
+  display: none;
+}
+.inbox-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+.inbox-badge {
+  flex: 0 0 auto;
+  padding: 0 6px;
+  border-radius: 8px;
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 16px;
+  color: var(--vscode-badge-foreground);
+  background: var(--vscode-badge-background);
+}
+.inbox-item.queue .inbox-badge {
+  color: var(--vscode-descriptionForeground);
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--vscode-panel-border, rgba(128, 128, 128, 0.4));
+}
+.inbox-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--vscode-foreground);
+}
+.inbox-files {
+  color: var(--vscode-descriptionForeground);
+}
+.inbox-actions {
+  flex: 0 0 auto;
+  display: inline-flex;
+  gap: 2px;
+}
+.inbox-btn {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--vscode-textLink-foreground);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.inbox-btn:hover {
+  background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.15));
+}
+.inbox-btn:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+}
+.inbox-cancel {
+  color: var(--vscode-descriptionForeground);
+  padding: 1px 3px;
+}
+.inbox-strip:not(.hidden) + .composer-box {
+  position: relative; /* stay above the strip's tucked-under edge */
+}

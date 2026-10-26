@@ -37,3 +37,9 @@ sample-workspace/**
 .mcp.json
 opencode.json
 graphoxide-out/**
+test-live/**
+out-live/**
+out-integration/**
+test-integration/**
+tsconfig.integration.json
+.playwright-mcp/**
