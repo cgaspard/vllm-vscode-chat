@@ -28,7 +28,7 @@ The official Claude Code and Codex VS Code extensions are **not open source**, s
 - **A reachable [vLLM](https://docs.vllm.ai) server** exposing its OpenAI-compatible API (default `http://127.0.0.1:8000/v1`). vLLM runs on **Linux / WSL / Docker** (and macOS via Docker Model Runner); it has no native Windows build. On Windows/macOS, run vLLM in WSL/Docker or on a remote GPU box and point the extension at its URL — the chat panel works as a pure client on every platform.
 - **Optional, for the local Model Manager:** a `vllm` install (or `python -m vllm`) and the Hugging Face CLI (`pip install -U "huggingface_hub[cli]"`) on the same machine as VS Code.
 
-> **[OpenCode](https://opencode.ai) is bundled** — the matching platform binary ships inside the extension, so there's nothing extra to install and it works offline. Power users can point at their own build with `vllmCode.opencodePath`; an install on your `PATH` or in `~/.opencode/bin` is preferred over the bundled copy if present.
+> **[OpenCode](https://opencode.ai) is bundled** — the matching platform binary ships inside the extension, so there's nothing extra to install and it works offline. Power users can point at their own build with `vllmCode.opencodePath`. An OpenCode install elsewhere on your machine is never picked up automatically — the panel always runs the version it was tested with (OpenCode 2 is not supported yet).
 
 ## Quick start
 
@@ -46,7 +46,7 @@ To manage models locally, run **vLLM Code: Manage Local Models** (toolbar button
 | --- | --- | --- |
 | `vllmCode.serverUrl` | `http://127.0.0.1:8000/v1` | OpenAI-compatible vLLM base URL (`/v1` added if omitted) |
 | `vllmCode.apiKey` | _(none)_ | Bearer token for a server started with `--api-key` |
-| `vllmCode.opencodePath` | _(bundled)_ | Override path to an `opencode` binary; empty uses your own install (PATH / `~/.opencode`) or the bundled one |
+| `vllmCode.opencodePath` | _(bundled)_ | Override path to an `opencode` 1.x binary; empty uses the bundled one |
 | `vllmCode.serverPort` | `0` | Embedded OpenCode server port (0 = auto) |
 | `vllmCode.defaultModel` | _(first)_ | Default model id (must match `/v1/models`) |
 | `vllmCode.agent` | `build` | `build` (can edit) or `plan` (read-only) |

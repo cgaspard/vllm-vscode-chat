@@ -6,7 +6,7 @@
   "publisher": "cgaspard",
   "license": "MIT",
   "icon": "media/icon.png",
-  "opencodeVersion": "1.18.26",
+  "opencodeVersion": "1.19.4",
   "engines": {
     "vscode": "^1.104.0"
   },
@@ -146,7 +146,7 @@
         "vllmCode.opencodePath": {
           "type": "string",
           "default": "",
-          "description": "Override path to an opencode binary. Leave empty to use your own install (PATH, ~/.opencode/bin/opencode) if present, otherwise the binary bundled with this extension."
+          "description": "Override path to an opencode binary. Leave empty to use the binary bundled with this extension (OpenCode 1.x). A system-wide OpenCode install is not used automatically, so upgrading it (e.g. to OpenCode 2, which this extension does not support yet) cannot break the panel."
         },
         "vllmCode.serverPort": {
           "type": "number",
