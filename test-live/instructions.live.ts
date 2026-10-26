@@ -7,7 +7,7 @@ import { createHost } from '../src/opencode/embedded';
 import { OpencodeV2Client } from '../src/opencode/v2client';
 
 const BASE = process.env.LIVE_BASE_URL ?? 'http://127.0.0.1:1234/v1';
-const MODEL = process.env.LIVE_MODEL ?? 'qwen3-vl-30b-a3b-instruct-mlx';
+const MODEL = process.env.LIVE_MODEL ?? 'qwen/qwen3-vl-4b';
 (async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-ins-'));
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-ins-ws-'));

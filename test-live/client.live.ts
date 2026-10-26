@@ -5,7 +5,7 @@
 //
 // Env: LIVE_BASE_URL (default http://127.0.0.1:1234/v1 — any OpenAI-compatible
 // server works; vLLM itself is not needed), LIVE_MODEL (default
-// qwen3-vl-30b-a3b-instruct-mlx).
+// qwen/qwen3-vl-4b).
 //
 // The config mirrors what OpencodeServerManager builds: the panel's `vllm`
 // provider, declared under its engine id (OpenCode 2's built-in vLLM plugin
@@ -22,7 +22,7 @@ import { OpencodeV2Client } from '../src/opencode/v2client';
 
 const REPO = path.resolve(__dirname, '..');
 const BASE_URL = process.env.LIVE_BASE_URL ?? 'http://127.0.0.1:1234/v1';
-const MODEL = process.env.LIVE_MODEL ?? 'qwen3-vl-30b-a3b-instruct-mlx';
+const MODEL = process.env.LIVE_MODEL ?? 'qwen/qwen3-vl-4b';
 const PROVIDER = 'vllm';
 const ENGINE_PROVIDER = toEngineProviderID(PROVIDER);
 
