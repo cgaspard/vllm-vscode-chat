@@ -10,6 +10,9 @@
 // Prompts are text-only on purpose: this harness opens VS Code without a
 // workspace folder, so the agent's working directory is the home directory.
 import * as assert from 'node:assert';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import * as vscode from 'vscode';
 import * as helpers from './helpers';
 
@@ -36,6 +39,27 @@ const assistantText = async () => (await allText('.msg.assistant .part-text')).j
   this.timeout(600_000);
   let restore: unknown;
   const cfg = () => vscode.workspace.getConfiguration('vllmCode');
+  // A chain of instructions, each naming the next, so the steer test's task
+  // takes several steps a model cannot batch into one. It lives in a temp dir
+  // (this harness has no workspace), read with the shell tool.
+  const steps = fs.mkdtempSync(path.join(os.tmpdir(), 'vllm-live-steps-'));
+  for (let i = 1; i <= 5; i++) {
+    fs.writeFileSync(
+      path.join(steps, `${i}.txt`),
+      i < 5
+        ? `Step ${i} of 5. Use the shell tool to run \`sleep 3; cat ${path.join(steps, `${i + 1}.txt`)}\` and do what it prints.\n`
+        : 'Step 5 of 5. Reply with exactly: ALL-FIVE-DONE\n',
+    );
+  }
+  /**
+   * vLLM Code has no permission modes: leaving the (absent) workspace always
+   * asks. Allow the step files, the only thing these prompts touch outside it.
+   */
+  const allowSteps = async () => {
+    if ((await count('.perm-card:not(.resolved)')) > 0 && String(await helpers.text('.perm-card:not(.resolved)')).includes(steps)) {
+      await helpers.click('.perm-card:not(.resolved) .perm-btn.allow-once');
+    }
+  };
 
   before(async () => {
     await vscode.commands.executeCommand('workbench.action.closeAllEditors');
@@ -50,6 +74,7 @@ const assistantText = async () => (await allText('.msg.assistant .part-text')).j
       await vscode.commands.executeCommand('vllmCode._test.restoreServer', restore);
     }
     await cfg().update('defaultModel', undefined, vscode.ConfigurationTarget.Global);
+    fs.rmSync(steps, { recursive: true, force: true });
   });
 
   it('a typed prompt streams a reply into the transcript', async () => {
@@ -63,21 +88,19 @@ const assistantText = async () => (await allText('.msg.assistant .part-text')).j
 
   it('a message sent mid-turn steers the running turn', async () => {
     // Steering lands at the agent's next step boundary, so it needs a turn with
-    // several steps: five harmless sleeps, one tool call each.
+    // several steps: five, each a shell call that prints the next instruction.
     const usersBefore = await count('.msg.user');
     const toolsBefore = await count('.msg.assistant .part-tool');
-    await setInput(
-      'Use the shell tool to run the command `sleep 2` five times, as five separate tool calls, one after another. After the fifth, reply with exactly: ALL-FIVE-DONE',
-    );
+    await setInput(`Use the shell tool to run \`cat ${path.join(steps, '1.txt')}\` and do what it prints.`);
     await keydown('Enter');
-    await until(async () => (await count('.msg.assistant .part-tool')) > toolsBefore, 240_000, 'the first tool call');
+    await until(async () => (await allowSteps(), (await count('.msg.assistant .part-tool')) > toolsBefore), 240_000, 'the first tool call');
     await setInput('Stop. Do not run any more commands. Reply with exactly: STEERED-OK');
     await keydown('Enter');
-    await until(async () => (await count('.msg.user')) >= usersBefore + 2, 240_000, 'the steered message to be delivered');
-    await until(async () => /STEERED-OK/.test(await assistantText()), 240_000, 'the agent to act on the steer');
-    await until(async () => !(await busy()), 120_000, 'the turn to end');
+    await until(async () => (await allowSteps(), (await count('.msg.user')) >= usersBefore + 2), 240_000, 'the steered message to be delivered');
+    await until(async () => (await allowSteps(), /STEERED-OK/.test(await assistantText())), 240_000, 'the agent to act on the steer');
+    await until(async () => (await allowSteps(), !(await busy())), 120_000, 'the turn to end');
     const sleeps = (await count('.msg.assistant .part-tool')) - toolsBefore;
-    assert.ok(sleeps < 5, `the steer cut the task short (ran ${sleeps} of 5 sleeps)`);
+    assert.ok(sleeps < 5, `the steer cut the task short (ran ${sleeps} of 5 steps)`);
     assert.doesNotMatch(await assistantText(), /ALL-FIVE-DONE/, 'the original plan did not run to completion');
     assert.strictEqual(await count('.inbox-item'), 0, 'nothing left pending');
   });
