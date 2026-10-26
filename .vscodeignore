@@ -43,3 +43,6 @@ out-integration/**
 test-integration/**
 tsconfig.integration.json
 .playwright-mcp/**
+# The 1.x OpenCode binary a pre-2.0 checkout fetched into bin/. Nothing uses it
+# now, and a stale copy left in a working tree must never ship (180 MB).
+bin/**
