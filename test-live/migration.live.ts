@@ -18,6 +18,10 @@ const ROOT = process.env.MIGRATION_ROOT;
   const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
   const db = new DatabaseSync(path.join(ROOT, 'data', 'opencode', 'opencode.db'), { readOnly: true });
   const v1 = db.prepare('select directory, count(*) as n from session where parent_id is null group by directory').all() as Array<{ directory: string; n: number }>;
+  // Sessions 1.x left empty (a "New chat" never used) have nothing to load.
+  const v1Messages = new Map(
+    (db.prepare('select session_id as id, count(*) as n from message group by session_id').all() as Array<{ id: string; n: number }>).map((r) => [r.id, r.n]),
+  );
   db.close();
 
   const host = await createHost(path.resolve(__dirname, '..'), { root: ROOT }, JSON.stringify({}));
@@ -41,7 +45,7 @@ const ROOT = process.env.MIGRATION_ROOT;
       const client = new OpencodeV2Client(host, directory, 'migration');
       const sessions = await client.listSessions();
       check(`${path.basename(directory)}: exactly its ${n} 1.x session(s) listed`, sessions.length === n && sessions.every((x) => !x.directory || x.directory === directory), `${sessions.length} found`);
-      const first = sessions[0];
+      const first = sessions.find((x) => (v1Messages.get(x.id) ?? 0) > 0);
       if (first) {
         const msgs = await client.getMessages(first.id);
         const users = msgs.filter((m) => m.info.role === 'user').length;

@@ -104,6 +104,10 @@ async function main(): Promise<void> {
     check('turn reaches idle', !!(await idle(s.id, mark)));
     const written = fs.existsSync(path.join(ws, 'live.txt')) ? fs.readFileSync(path.join(ws, 'live.txt'), 'utf8') : '';
     check('write tool ran', written.includes('embedded ok'), written);
+    if (!written.includes('embedded ok')) {
+      const diag = events.slice(mark).filter((e) => /permission|tool|error/.test(e.type) || (e.type === 'message.part.updated' && (e.properties as any).part?.type === 'tool'));
+      console.log('      [diag]', JSON.stringify(diag.map((e) => [e.type, (e.properties as any).part?.tool ?? (e.properties as any).permission, (e.properties as any).part?.state?.status, (e.properties as any).part?.state?.error ?? (e.properties as any).patterns])).slice(0, 1500));
+    }
     const tys = new Set(events.slice(mark).map((e) => e.type));
     check('1.x events flow (user bubble, deltas, tool part, idle)', ['inbox.delivered', 'message.updated', 'message.part.delta', 'message.part.updated', 'session.idle'].every((t) => tys.has(t)), [...tys]);
     const msgs = await client.getMessages(s.id);
