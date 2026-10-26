@@ -4,7 +4,7 @@ import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { ExtensionConfig, getConfig } from '../config';
 import { clampContext } from '../core/context';
-import { augmentedPath, withLocalEnvironment } from '../core/mcp';
+import { augmentedPath, toEngineMcp, withLocalEnvironment } from '../core/mcp';
 import { opencodePermission } from '../core/permission';
 import { toEngineProviderID } from '../core/providerIds';
 import { discoverMcpServers } from '../mcp/discovery';
@@ -194,8 +194,10 @@ export class OpencodeServerManager {
       // use a model the user never picked.
       enabled_providers: [providerID],
       // Servers the user already declared for Claude Code / VS Code Copilot,
-      // plus our own setting. Omitted entirely when nothing is configured.
-      ...(Object.keys(mcp).length ? { mcp } : {}),
+      // plus our own setting, in OpenCode 2's native shape with Code Mode off
+      // so each MCP tool is a direct tool (see toEngineMcp). Omitted entirely
+      // when nothing is configured.
+      ...(Object.keys(mcp).length ? { mcp: toEngineMcp(mcp) } : {}),
       // Let the model ask the user clarifying questions via the built-in
       // `question` tool. "allow" surfaces the picker immediately (the picker is
       // the interaction; no redundant approval gate). The bridge relays the

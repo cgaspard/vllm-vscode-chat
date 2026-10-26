@@ -129,4 +129,10 @@ describe('panel: vLLM UI', function () {
     assert.match(String(await text('.msg.assistant')), /general kenobi[\s\S]*done/);
     assert.match(String(await text('#ctx-meter .ctx-label')), /^2K \/ 32K context/);
   });
+
+  it('an automatic compaction is flagged on the context meter', async () => {
+    await post(readyInit());
+    await ev('session.compacted', { sessionID: 's' });
+    assert.match(String(await text('#ctx-meter .ctx-label')), /compacted/);
+  });
 });
