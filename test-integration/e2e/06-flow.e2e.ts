@@ -3,6 +3,16 @@
 import * as assert from 'node:assert';
 import { assistantText, ask, busy, freshChat, h, send, turn, until } from './lib';
 
+/**
+ * A small model may still reach for a tool (e.g. writing the count to /tmp),
+ * which asks before leaving the workspace: deny it so the turn goes on.
+ */
+async function denyCards(): Promise<void> {
+  if ((await h.count('.perm-card:not(.resolved)')) > 0) {
+    await h.click('.perm-card:not(.resolved) .perm-btn.reject');
+  }
+}
+
 describe('e2e · steering, stopping, questions', function () {
   it('a message sent mid-turn steers the running task', async () => {
     await freshChat();
@@ -23,23 +33,24 @@ describe('e2e · steering, stopping, questions', function () {
 
   it('Alt+Enter queues a message for after the turn', async () => {
     await freshChat();
-    await send('Count from 1 to 30, one number per line.');
+    // A 4B reaches for a tool to "count" unless told not to.
+    await send('Do not use any tools. In your reply, write the numbers from 1 to 30, one per line.');
     await until(busy, 60_000, 'the turn to start');
     await send('Then reply with exactly: QUEUED-RAN', { queue: true });
-    await until(async () => /QUEUED-RAN/.test(await assistantText()), 300_000, 'the queued message to run');
+    await until(async () => (await denyCards(), /QUEUED-RAN/.test(await assistantText())), 300_000, 'the queued message to run');
     await turn();
     assert.strictEqual(await h.count('.inbox-item'), 0);
   });
 
   it('a queued message can be cancelled from the pending strip', async () => {
     await freshChat();
-    await send('Count from 1 to 60, one number per line.');
+    await send('Do not use any tools. In your reply, write the numbers from 1 to 60, one per line.');
     await until(busy, 60_000, 'the turn to start');
     await send('Reply with exactly: SHOULD-NOT-RUN', { queue: true });
     await until(async () => (await h.count('.inbox-item.queue')) === 1, 30_000, 'the queued message in the strip');
     await h.click('.inbox-item .inbox-cancel');
     await until(async () => (await h.count('.inbox-item')) === 0, 15_000, 'the strip to clear');
-    await turn(300_000);
+    await until(async () => (await denyCards(), !(await busy())), 300_000, 'the turn to end');
     await new Promise((r) => setTimeout(r, 3000));
     assert.ok(!(await busy()), 'nothing else ran');
     assert.doesNotMatch(await assistantText(), /SHOULD-NOT-RUN/, 'the cancelled message never reached the model');
@@ -48,7 +59,8 @@ describe('e2e · steering, stopping, questions', function () {
 
   it('the stop button stops a turn', async () => {
     await freshChat();
-    await send('Write a 1500-word essay about the history of compilers.');
+    // Told plainly, or a 4B loads a skill or asks a clarifying question first.
+    await send('Do not use any tools, skills or questions. Directly in your reply, write a 1500-word essay about the history of compilers.');
     await until(async () => (await assistantText()).length > 40, 240_000, 'streaming to begin');
     await h.click('#send'); // the send button is the stop button while busy
     await until(async () => !(await busy()), 60_000, 'the turn to stop');

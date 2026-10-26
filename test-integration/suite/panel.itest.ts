@@ -152,6 +152,13 @@ describe('panel: vLLM UI', function () {
     assert.match(String(await text('#ctx-meter .ctx-label')), /^2K \/ 32K context/);
   });
 
+  it('text inside a literal <template> in model output still shows', async () => {
+    await post(readyInit());
+    await ev('message.updated', { info: { id: 't1', sessionID: 's', role: 'assistant', time: { created: 1 } } });
+    await ev('message.part.updated', { part: { id: 't1:text:0', sessionID: 's', messageID: 't1', type: 'text', text: '<template>\nInside the template\n</template>' } });
+    assert.match(String(await text('.msg.assistant .part-text')), /Inside the template/);
+  });
+
   it('an automatic compaction is flagged on the context meter', async () => {
     await post(readyInit());
     // What the translator emits live: the marker part alone, then the summary turn.
