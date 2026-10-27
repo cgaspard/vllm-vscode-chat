@@ -72,17 +72,23 @@ VS Code webview (chat UI + Model Manager)
         │  postMessage
         ▼
 Extension host (bridge + process/HF/LoRA managers)
-        │  HTTP + SSE  (raw fetch)
+        │  in-process calls + event stream
         ▼
-opencode serve  ──@ai-sdk/openai-compatible──▶  vLLM (/v1/chat/completions)
-   (OPENCODE_CONFIG_CONTENT injected at launch)
+OpenCode 2 (@opencode/sdk,   ──@ai-sdk/openai-compatible──▶  vLLM (/v1/chat/completions)
+  embedded, no server)
 ```
 
-The extension enumerates models with vLLM's OpenAI-compatible `GET /v1/models`,
-then registers a `vllm` provider in OpenCode with those models (context limit
-from `--max-model-len`) via the `OPENCODE_CONFIG_CONTENT` environment variable —
-**nothing is written to your workspace or global config.** Chat streams over
+OpenCode runs inside the extension host through its embedding SDK — no
+process, no port, no password. The extension enumerates models with vLLM's
+OpenAI-compatible `GET /v1/models` and hands OpenCode a `vllm` provider with
+those models (context limit from `--max-model-len`) in memory when it starts —
+**nothing is written to your workspace or global config**, and it is the only
+provider enabled (a key exported in your shell, or OpenCode's own vLLM
+auto-discovery, is never picked up behind your back). Chat streams over
 `/v1/chat/completions` with usage reporting, which drives the context meter.
+Its sessions, database and settings live in the extension's own storage,
+isolated from any OpenCode you run yourself; chats from earlier versions carry
+over.
 
 The Model Manager spawns `vllm serve` (or `python -m vllm`) for local instances,
 parses the startup log for readiness, runs `hf download` for Hugging Face
